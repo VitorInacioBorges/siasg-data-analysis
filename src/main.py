@@ -51,28 +51,29 @@ from dotenv import load_dotenv
 
 load_dotenv() # .env file loading
 
-# Fronteira de referência da grade de blocos: uma segunda-feira arbitrária,
-# fixa para sempre. Todas as fronteiras válidas são EPOCH + k * chunk_days.
-# Ancorar numa data absoluta (em vez de contar a partir da ponta da janela) é
-# o que faz a chave de um bloco ser a mesma ontem, hoje e amanhã — sem isso,
-# o checkpoint de uma execução não serve para a seguinte.
+# Reference boundary of the chunk grid: an arbitrary Monday, fixed forever.
+# Every valid boundary is CHUNK_EPOCH + k * chunk_days. Anchoring to an
+# absolute date — rather than counting from the edge of the window — is what
+# makes a chunk's key the same yesterday, today, and tomorrow. Without it, the
+# window slides by a day on every run, every boundary moves with it, and one
+# run's checkpoint is worthless to the next.
 CHUNK_EPOCH = date(2000, 1, 3)
 
 def align_to_grid(day: date, chunk_days: int) -> date:
-    """Recua `day` até a fronteira anterior da grade global."""
-    # O resto da divisão diz quantos dias `day` está depois da última
-    # fronteira; subtraí-lo pousa exatamente nela.
+    """Moves `day` back to the previous boundary of the global grid."""
+    # The remainder says how many days `day` sits past the last boundary;
+    # subtracting it lands exactly on that boundary.
     return day - timedelta(days=(day - CHUNK_EPOCH).days % chunk_days)
 
 def iter_date_chunks(start: date, end: date, chunk_days: int) -> Iterator[tuple[date, date]]:
     """Splits the window into consecutive chunks so no single request is too wide."""
-    # Começa na fronteira da grade, não na ponta da janela. Isso baixa alguns
-    # dias a mais que WINDOW_DAYS pediu — um superconjunto, nunca um buraco.
+    # Starts on a grid boundary, not on the edge of the window. That pulls in
+    # a few days more than WINDOW_DAYS asked for — a superset, never a gap.
     current = align_to_grid(start, chunk_days)
     while current < end:
-        # Sem min(): a grade define o fim, mesmo que ele passe de `end`. Um
-        # bloco truncado teria uma chave que mudaria na próxima execução, que
-        # é justamente o que estamos consertando.
+        # No min() here: the grid decides the end, even when it runs past
+        # `end`. A truncated chunk would carry a key that changes on the next
+        # run, which is the very problem this grid exists to fix.
         chunk_end = current + timedelta(days=chunk_days)
         yield current, chunk_end
         current = chunk_end
