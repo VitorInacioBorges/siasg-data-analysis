@@ -1,0 +1,7 @@
+.agents
+.claude
+.cursor
+.windsurf
+__pycache__
+venv
+data
