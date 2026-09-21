@@ -23,11 +23,11 @@ from read_type_methods import _read_float_min, _read_int_min, _read_text
 # and every value silently becomes the dataclass default. Measured: a .env
 # saying MAX_WORKERS=2 read back as 3. For a data pipeline that is the worst
 # kind of failure, because the run succeeds with the wrong configuration.
-CAMINHO_ENV = Path(__file__).resolve().parent.parent / ".env"
-if CAMINHO_ENV.exists():
-    load_dotenv(CAMINHO_ENV)
+ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+if ENV_PATH.exists():
+    load_dotenv(ENV_PATH)
 else:
-    print(f"Aviso: {CAMINHO_ENV} não existe; usando apenas os valores padrão.")
+    print(f"Aviso: {ENV_PATH} não existe; usando apenas os valores padrão.")
 
 
 @dataclass
@@ -50,11 +50,11 @@ class PipelineSettings:
         """Builds a PipelineSettings from .env, validating as it goes."""
         # One root for all three layers, so a test run redirects everything by
         # setting a single variable.
-        raiz = Path(_read_text("DATA_DIR", "data"))
+        root = Path(_read_text("DATA_DIR", "data"))
         return cls(
-            raw_csv=raiz / "raw" / _read_text("RAW_CSV_NAME", "contract_items.csv"),
-            interim_dir=raiz / "interim",
-            processed_dir=raiz / "processed",
+            raw_csv=root / "raw" / _read_text("RAW_CSV_NAME", "contract_items.csv"),
+            interim_dir=root / "interim",
+            processed_dir=root / "processed",
             figures_dir=Path(_read_text("FIGURES_DIR", "reports/figures")),
             panel_freq=_read_text("PANEL_FREQ", "W"),
             # A floor of 1 everywhere a zero would make the stage meaningless:
