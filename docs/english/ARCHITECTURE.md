@@ -205,6 +205,195 @@ write.
 describe the same download, or resuming would append rows on top of a file
 that no longer matches.
 
+## The data preparation pipeline
+
+The collector delivers a raw CSV. The pipeline turns it into a weekly panel
+with features, ready for a scikit-learn model. The entry point is
+`src/prepare.py`, and each stage is a function in `src/pipeline/`, testable on
+its own.
+
+### Two regimes, separated by the panel
+
+This is the decision that organises everything else.
+
+Up to the panel, the stages run **once over the whole dataset** and write the
+result to a file. That is correct because they are deterministic:
+deduplicating by `idCompraItem` and applying a value ceiling give the same
+answer regardless of which cross-validation fold is running.
+
+From the panel onwards, nothing can be precomputed. A `StandardScaler`'s mean
+computed over train and test together carries the future into the training
+set — that is leakage, and it produces a flattering score with a useless
+model. So `transform.py` returns the transformer **unfitted**: the caller
+embeds it in a `Pipeline`, and scikit-learn refits it inside every fold.
+
+The boundary between the two regimes is exactly
+`data/processed/painel.parquet`.
+
+### The stages
+
+| Stage | Module | What it writes |
+|---|---|---|
+| `load` | `pipeline/load.py` | — (in memory) |
+| `clean` | `pipeline/clean.py` | `interim/itens_limpos.parquet`, `interim/quarentena.parquet` |
+| `aggregate` | `pipeline/aggregate.py` | `processed/painel.parquet` |
+| `features` | `pipeline/features.py` | `processed/painel_features.parquet` |
+| `plots` | `pipeline/plots.py` | `reports/figures/*.png` |
+
+`split.py` and `transform.py` are not stages: they write nothing and do not
+run during a `prepare.py` execution. They are the pieces the modelling step
+will consume.
+
+### What each file does
+
+#### `src/prepare.py`
+
+Orchestration and entry point, in the same shape as `main.py`: `main()` reads
+the configuration and decides the exit code, `run_stages()` runs the stages in
+order. The `--ate` option stops at a stage, which lets you inspect one step
+before going further.
+
+What sets this module apart are the **invariants it asserts between stages**,
+which fail loudly rather than silently:
+
+- cleaning splits the frame, it never shrinks it:
+  `len(kept) + len(quarantined)` must equal `len(raw)`;
+- the panel is a rectangle: `len(panel)` must equal `weeks × combinations`;
+- aggregation preserves the sum: the panel total must match the cleaned-items
+  total.
+
+The first one would have caught the duplicate rows the day they appeared.
+
+#### `src/classes/pipeline_settings.py`
+
+Sibling of `Settings`: same contract, different concern. `Settings` configures
+the collector that produces `data/raw/`; this configures the stages that
+consume it. They are separate classes because they are read at different
+times by different entry points, and a run of one does not need the other's
+validation to pass.
+
+One detail is worth recording: this module's `load_dotenv()` is anchored to
+the file, not to the caller's frame. Without that, under `python -c` there is
+no calling file, the search falls back to the working directory, finds
+nothing, and every value silently becomes the dataclass default. Measured: a
+`.env` saying `MAX_WORKERS=2` read back as 3. For a data pipeline that is the
+worst kind of failure, because the run succeeds with the wrong configuration.
+
+#### `src/pipeline/load.py`
+
+Typed reading in slices, deduplication by `idCompraItem`, and a status filter.
+Three non-obvious details:
+
+- **`on_bad_lines="warn"`, not `"skip"`.** Both discard a row with extra
+  fields; the first makes pandas say so in its own words instead of leaving
+  you to infer it.
+- **Truncation detection.** A CSV interrupted inside a quoted field makes
+  pandas raise, and `on_bad_lines` does not catch it. The module trades the
+  traceback for a message that says what to do.
+- **Race with the collector.** A snapshot of the file is taken before and
+  after the read. If the file moved in between, the partial-row heuristic is
+  discarded rather than applied, because no check is exact on a file being
+  appended to — and acting on a stale measurement has discarded a legitimate
+  row before.
+
+#### `src/pipeline/clean.py`
+
+The only stage that removes rows on judgement. The rule reads the **awarded
+total**, not the quantity, because the absurdity is in the product.
+
+The measured problem: 6 rows out of 1,440,492 carry 53.77% of the total value,
+and they are data-entry errors at the source. The largest is 1,713,940 units
+of postal service at R$ 132,000 each — R$ 226 billion, 31% of the dataset in
+one row. Left in, the year reads R$ 735 bn; taken out, R$ 340 bn.
+
+An earlier design measured implausible quantity within each class and was
+dropped after being measured against a full year: it missed that largest row
+entirely (z = 3.41 against a threshold of 8), and the 177 rows it caught on
+its own were legitimate public purchases at scale — 28 million vaccine doses,
+8.8 million rounds of ammunition, 8,797 textbooks. Quantity within a class
+does not separate bulk from typo.
+
+Known limitation, accepted: two real errors stay in — 867,796,000 kg of goat
+meat and 850,000 laptops, together 1% of the total. Reaching them would need a
+ceiling that also removes the school meal programme.
+
+Nothing is deleted. Removed rows come back as a second frame with a `motivo`
+column, which the caller writes to `interim/quarentena.parquet`.
+
+#### `src/pipeline/aggregate.py`
+
+Where the grain changes: one row per item becomes one row per period. This is
+the stage that makes forecasting possible at all, because at the item grain
+there is no "next week" — only items. The panel puts time on the row.
+
+Two details decide whether the result is usable:
+
+- **Classes are reduced to the largest by value.** The real data has 434 of
+  them, and the top 50 already cover 94.1% of the money. One-hot encoding all
+  434 would add more columns than the panel has time steps. The rest goes to
+  the `Outras` bucket; a missing class gets its own bucket, `Sem classe`,
+  because the two mean different things.
+- **The panel must come out a complete rectangle.** After a `groupby`, a week
+  in which a class bought nothing simply does not exist, and a lag would reach
+  three weeks back instead of one. A week with no purchase is a zero, not a
+  gap — but the median of an empty set stays null, because there was no price
+  to observe, which is not the same as a price of zero.
+
+#### `src/pipeline/features.py`
+
+Makes implicit information explicit, because a model only sees its columns.
+**Every feature here looks backwards.** A column that peeked forward would be
+the leak that produces a high score and a useless model.
+
+- The week number also goes in as sine and cosine, because week 52 and week 1
+  are neighbours, which a raw integer cannot express.
+- Lags and rolling means are computed **per combination**. The grouping is
+  what stops one class's lag from reaching into another's history.
+- The rolling mean applies `shift(1)` before `rolling`: including the week
+  being predicted would be exactly the leak this module avoids.
+- `numeric_features(cfg)` is a function, not a constant. With `PANEL_FREQ=M`
+  the annual lag is called `valor_lag_12`, and a fixed list would point at
+  columns that do not exist.
+
+**A structural limitation, not an accidental one:** with a 365-day collection
+window the panel has 52 weekly steps, so `valor_lag_52` comes out entirely
+null. Forecasting a year ahead needs a lag of 52 or more, because the model
+cannot be handed a value it will not know at prediction time. Short horizons,
+one to eight weeks, are well served by the short lags. Widening `WINDOW_DAYS`
+populates `lag_52` without changing a line of this module.
+
+#### `src/pipeline/split.py`
+
+The temporal split, and the reason it cannot be scikit-learn's
+`TimeSeriesSplit` alone. The panel holds about 53 rows per week, one per
+combination. `TimeSeriesSplit` cuts by row position, so it lands in the middle
+of a week and puts half of that week's classes in train and the other half in
+test. The model then sees part of the very period it is being scored on.
+
+So the split is taken over the distinct weeks and only then expanded to rows.
+
+#### `src/pipeline/transform.py`
+
+A factory, not a fitted object — for the reason explained in "two regimes"
+above. It imputes the median on the numeric columns, because lags are null for
+the first weeks of every combination and dropping those rows would throw away
+the start of every series. It encodes the categoricals with
+`handle_unknown="ignore"`, because under a temporal split a class that appears
+only late in the year is exactly the case of a category missing from training.
+
+It asks `features.py` for the column list rather than repeating it, so the two
+modules cannot drift apart.
+
+#### `src/pipeline/plots.py`
+
+The four figures, and one rule they all obey: **raw and clean appear side by
+side.** Six rows carry more than half of the value, so a chart of the cleaned
+series alone would hide the most consequential decision in the pipeline.
+
+The palette has two categorical slots, `#2a78d6` and `#eb6834`, validated
+against the six checks of the `dataviz` method on the light surface. Do not
+substitute without revalidating.
+
 ## Strengths
 
 **Constant memory usage.** Nothing accumulates. One page lives in memory
@@ -233,6 +422,19 @@ the reasoning.
 **Graceful degradation in the summary.** Narrowing `COLUMNS` weakens the
 report instead of breaking it.
 
+**Leakage is prevented by construction, not by discipline.** The transformer
+comes out unfitted and the split cuts whole weeks. There is no way for a
+distracted contributor to fit a scaler over the whole dataset without
+rewriting the module.
+
+**The invariants fail loudly.** `prepare.py` asserts between stages that
+cleaning lost no rows, that the panel is a rectangle, and that aggregation
+preserved the sum. A bug in those three would be silent and very expensive.
+
+**Nothing is discarded in silence.** Every row the cleaning removes comes back
+in `quarentena.parquet` with its reason, and the fourth figure shows how much
+value left.
+
 ## Weaknesses
 
 **There is no real Python package.** `__init__.py` files are missing from
@@ -240,25 +442,24 @@ report instead of breaking it.
 and that fragility is exactly what produced the broken relative imports in
 `settings.py`.
 
-**There is no `requirements.txt`.** Dependencies are described in prose in the
-`README.md`, without pinned versions. Two machines can resolve different
-`pandas` versions and produce different results.
-
 **Paths depend on the working directory.** `OUTPUT_CSV` and `CHECKPOINT_FILE`
 are relative to wherever the command was launched, not to the script. Running
 from `src/` writes to `src/data/`; running from the root writes to `data/`. A
 resume launched from the wrong place will not find the earlier progress.
 
-**There are no tests.** No suite covers the chunk arithmetic, the HTTP error
-classification, or the resume logic — precisely the three places where a bug
-is silent and expensive.
+**The collector has no tests.** The pipeline has 49, but none of them cover
+`iter_date_chunks()`, the HTTP error classification in `fetch_page()`, or the
+`Checkpoint` lifecycle — precisely the three places in the collector where a
+bug is silent and expensive.
+
+**`valor_lag_52` comes out empty with the current window.** This follows from
+the 365-day window rather than from a defect, and it is documented in
+`features.py`. The practical effect is that the one-year horizon rests on
+trend and calendar alone until the collection window grows.
 
 **Messages in two languages.** User-facing errors are in Portuguese, comments
 and docstrings in English. It is a defensible choice, but it is recorded
 nowhere, and the boundary has already slipped in places.
-
-**`data/` is not in `.gitignore`.** A multi-gigabyte CSV can be committed by
-accident. The `venv/` folder has the same problem.
 
 **The checkpoint does not validate the configuration.** Resuming after
 changing `CHUNK_DAYS` or the filters in `.env` produces a CSV that mixes two
@@ -279,15 +480,16 @@ In order of return on effort:
 1. Record in the checkpoint the configuration that produced it, and refuse
    incompatible resumes.
 2. Write tests for `iter_date_chunks()`, for the HTTP status classification in
-   `fetch_page()`, and for the `Checkpoint` lifecycle.
-3. Add `__init__.py` to `src/` and `src/classes/`, turning the project into a
-   real package.
-4. Create `requirements.txt` with pinned versions.
-5. Add `data/` and `venv/` to `.gitignore`.
-6. Resolve paths relative to the project root rather than the working
+   `fetch_page()`, and for the `Checkpoint` lifecycle, bringing the collector
+   up to the pipeline's level.
+3. Add `__init__.py` to `src/`, `src/classes/`, and `src/pipeline/`, turning
+   the project into a real package.
+4. Resolve paths relative to the project root rather than the working
    directory.
-7. Back off automatically when HTTP 429 becomes frequent, instead of leaving
+5. Back off automatically when HTTP 429 becomes frequent, instead of leaving
    `MAX_WORKERS` to be tuned by hand.
+6. Widen `WINDOW_DAYS` beyond one year, which populates `valor_lag_52` and
+   with it the annual forecasting horizon.
 
 ## Recorded decisions
 

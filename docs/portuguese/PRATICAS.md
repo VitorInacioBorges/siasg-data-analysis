@@ -121,13 +121,16 @@ que substitua a anterior e marque a antiga como substituída.
 
 ### Organização
 
-- `src/main.py` contém a orquestração e nada mais.
+- `src/main.py` contém a orquestração do coletor e nada mais.
+- `src/prepare.py` contém a orquestração do pipeline e nada mais.
 - `src/classes/` contém uma classe por arquivo, cada uma com uma única
   responsabilidade.
+- `src/pipeline/` contém um estágio por arquivo, cada um testável sozinho.
 - `src/read_type_methods.py` contém os leitores tipados do `.env`.
 
-Uma nova responsabilidade durável ganha um arquivo em `classes/`. Uma função
-auxiliar usada só por `main.py` fica em `main.py`.
+Uma nova responsabilidade durável ganha um arquivo em `classes/`. Um novo
+estágio do pipeline ganha um arquivo em `pipeline/`. Uma função auxiliar usada
+só por um ponto de entrada fica nele.
 
 ### Comentários
 
@@ -155,13 +158,16 @@ Comentários explicam **por que**, não **o que**. O código já diz o que faz.
 Todo parâmetro novo passa pelo mesmo caminho:
 
 1. Adicione a chave em `src/.env.example`, com comentário explicando o padrão.
-2. Adicione o campo em `Settings`, com anotação de tipo.
-3. Leia a chave em `Settings.from_env()` usando o leitor tipado adequado.
-4. Valide na `from_env()` tudo que a API rejeitaria.
+2. Adicione o campo em `Settings` (coletor) ou `PipelineSettings` (pipeline),
+   com anotação de tipo.
+3. Leia a chave na `from_env()` da classe, usando o leitor tipado adequado.
+4. Valide na `from_env()` tudo que a API ou o estágio rejeitaria.
 5. Documente a chave na tabela correspondente em `EXECUCAO.md` e
    `EXECUTION.md`.
 
-Nenhum módulo além de `Settings.from_env()` chama `os.getenv`.
+Nenhum módulo além das duas `from_env()` chama `os.getenv`. As duas classes
+são separadas de propósito: uma execução do pipeline não precisa que a
+validação do coletor passe, e vice-versa.
 
 ### Tratamento de erros
 
@@ -176,7 +182,7 @@ de fechar o CSV, e o arquivo ficaria inconsistente com o checkpoint.
 
 ### Durabilidade
 
-Duas invariantes não podem ser quebradas:
+No coletor, duas invariantes não podem ser quebradas:
 
 1. Um bloco só é marcado no checkpoint depois que todas as suas linhas foram
    gravadas e descarregadas em disco.
@@ -184,6 +190,32 @@ Duas invariantes não podem ser quebradas:
 
 Qualquer mudança que toque `collect()`, `CsvWriter` ou `Checkpoint` precisa
 preservar as duas.
+
+No pipeline, três invariantes são afirmadas em `prepare.py` entre os estágios,
+e precisam continuar valendo:
+
+1. A limpeza divide o quadro, nunca o encolhe:
+   `len(limpos) + len(quarentena) == len(bruto)`.
+2. O painel é um retângulo completo:
+   `len(painel) == semanas × combinações`.
+3. A agregação preserva a soma dos valores.
+
+Elas são `assert`, e é proposital: uma falha aqui é defeito de código, não
+entrada ruim do usuário, e precisa parar a execução alto.
+
+### Tratamento de dados
+
+Três regras valem para todo estágio do pipeline:
+
+- **`data/raw/` nunca é editada.** É a testemunha. Todo artefato derivado vai
+  para `interim/` ou `processed/`, de modo que apagar as duas e rodar de novo
+  reconstrói tudo.
+- **Nada é descartado em silêncio.** Linha removida volta em
+  `quarentena.parquet` com a coluna `motivo`.
+- **Nada que o modelo consome pode ser pré-ajustado.** Transformadores saem
+  não ajustados, para o scikit-learn reajustar dentro de cada dobra. Uma média
+  calculada sobre treino e teste juntos é vazamento, e o sintoma é uma nota
+  boa demais.
 
 ## Git
 
