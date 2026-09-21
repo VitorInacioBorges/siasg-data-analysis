@@ -432,9 +432,16 @@ def test_embedded_newlines_do_not_raise_a_false_alarm(tmp_path, capsys):
         encoding="utf-8-sig")
 
     df = load_raw(path, _cfg_for(path))
+    out = capsys.readouterr().out
 
     assert len(df) == 2
-    assert "leitor de CSV" not in capsys.readouterr().out
+    # Duas afirmações, uma por regressão possível. "puladas" é a palavra da
+    # contagem por bytes que foi deletada: se alguém a reinstalar, a mensagem
+    # dela ("...foram puladas por estarem malformadas") reaparece aqui — e ela
+    # NÃO contém "leitor de CSV", então afirmar só esse prefixo deixaria a
+    # regressão passar.
+    assert "puladas" not in out
+    assert "leitor de CSV" not in out
 
 
 def test_drops_a_partial_last_row(tmp_path, capsys):
@@ -702,7 +709,12 @@ def load_raw(path: Path, cfg: PipelineSettings) -> pd.DataFrame:
     # parity across 859 MB, which measured 7,85s against 0,39s for the naive
     # version. Asking pandas is exact and free.
     for warning in parser_warnings:
-        print(f"Aviso do leitor de CSV: {str(warning.message)[:300]}")
+        # catch_warnings(record=True) records every category, and
+        # simplefilter only controls deduplication for the one it names — so
+        # without this guard a FutureWarning from a dependency would be
+        # announced to the reader as "the CSV reader discarded rows".
+        if issubclass(warning.category, pd.errors.ParserWarning):
+            print(f"Aviso do leitor de CSV: {str(warning.message)[:300]}")
 
     df = df.drop(columns=[c for c in DEAD_COLUMNS if c in df.columns])
 
