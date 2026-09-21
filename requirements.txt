@@ -1,0 +1,7 @@
+pandas>=3.0
+requests>=2.34
+python-dotenv>=1.0
+matplotlib>=3.11
+scikit-learn>=1.9
+pyarrow>=16.0
+pytest>=8.0
