@@ -28,8 +28,11 @@ pyarrow, pytest.
 - Códigos de saída: `0` sucesso (inclusive "nada sobreviveu aos filtros"), `1`
   erro de configuração ou entrada inválida, `130` Ctrl+C.
 - Grão do painel: `semana × materialOuServicoNome × classe`. `PANEL_FREQ=W`.
-- Regra de plausibilidade: unilateral (só quantidade alta), em `log10`, por
-  `codigoClasse`, com `QTY_MAD_THRESHOLD=8` e `MIN_CLASS_ITEMS=30`.
+- Regra de plausibilidade: teto absoluto no valor de um item de linha,
+  `VALUE_CEILING=10000000000` (R$ 10 bi). Medido no ano inteiro: remove 6 itens
+  de 1.440.492 e preserva os contratos legítimos auditados. A regra de
+  quantidade por classe foi implementada, medida e descartada — ela não pegava
+  o maior erro da base e o que pegava sozinha era compra legítima em escala.
 - Paleta dos gráficos: `#2a78d6` (azul) e `#eb6834` (laranja). Validada pelas
   seis checagens da skill `dataviz` em modo claro; não substituir sem revalidar.
 - Arquivos sob `docs/superpowers/` ficam só em português.
@@ -51,8 +54,8 @@ pyarrow, pytest.
 - Consumes: `_read_text`, `_read_int_min`, `_read_float_min` de `src/read_type_methods.py`
 - Produces: `PipelineSettings` com os campos `raw_csv: Path`,
   `interim_dir: Path`, `processed_dir: Path`, `figures_dir: Path`,
-  `panel_freq: str`, `top_classes: int`, `qty_mad_threshold: float`,
-  `min_class_items: int`, `status_filter: str`, `read_chunk_rows: int`, e o
+  `panel_freq: str`, `top_classes: int`, `value_ceiling: float`,
+  `status_filter: str`, `read_chunk_rows: int`, e o
   construtor `PipelineSettings.from_env() -> PipelineSettings`
 
 - [ ] **Step 1: instalar as dependências e registrá-las**
@@ -80,8 +83,6 @@ Ao fim dos dois arquivos (o `.env` usa CRLF — preserve):
 # Pipeline de tratamento (src/prepare.py)
 # PANEL_FREQ         grão temporal do painel. W = semanal.
 # TOP_CLASSES        classes mantidas por valor; o resto vira "Outras".
-# QTY_MAD_THRESHOLD  corte de plausibilidade, em z robusto sobre log10(qtd).
-# MIN_CLASS_ITEMS    abaixo disso a classe não tem MAD confiável.
 # STATUS_FILTER      situação considerada gasto efetivo.
 # READ_CHUNK_ROWS    linhas lidas por fatia do CSV bruto.
 # DATA_DIR           raiz das três camadas de dados (raw, interim, processed).
@@ -95,8 +96,6 @@ Ao fim dos dois arquivos (o `.env` usa CRLF — preserve):
 # ===========================================================================
 PANEL_FREQ=W
 TOP_CLASSES=50
-QTY_MAD_THRESHOLD=8
-MIN_CLASS_ITEMS=30
 STATUS_FILTER=Homologado
 READ_CHUNK_ROWS=200000
 DATA_DIR=data
@@ -134,14 +133,12 @@ from read_type_methods import ConfigError
 
 
 def test_reads_the_defaults(monkeypatch):
-    for key in ("PANEL_FREQ", "TOP_CLASSES", "QTY_MAD_THRESHOLD",
-                  "MIN_CLASS_ITEMS", "STATUS_FILTER", "READ_CHUNK_ROWS"):
+    for key in ("PANEL_FREQ", "TOP_CLASSES", "VALUE_CEILING",
+                  "STATUS_FILTER", "READ_CHUNK_ROWS"):
         monkeypatch.delenv(key, raising=False)
     cfg = PipelineSettings.from_env()
     assert cfg.panel_freq == "W"
     assert cfg.top_classes == 50
-    assert cfg.qty_mad_threshold == 8.0
-    assert cfg.min_class_items == 30
     assert cfg.status_filter == "Homologado"
 
 
@@ -241,8 +238,6 @@ class PipelineSettings:
     figures_dir: Path
     panel_freq: str = "W"
     top_classes: int = 50
-    qty_mad_threshold: float = 8.0
-    min_class_items: int = 30
     status_filter: str = "Homologado"
     read_chunk_rows: int = 200_000
     value_ceiling: float = 10_000_000_000.0  # R$ per line item
@@ -263,8 +258,6 @@ class PipelineSettings:
             # zero classes leaves nothing to group by, a zero threshold flags
             # every row, and a zero chunk makes pandas raise.
             top_classes=_read_int_min("TOP_CLASSES", 50, 1),
-            qty_mad_threshold=_read_float_min("QTY_MAD_THRESHOLD", 8.0, 0.1),
-            min_class_items=_read_int_min("MIN_CLASS_ITEMS", 30, 1),
             status_filter=_read_text("STATUS_FILTER", "Homologado"),
             read_chunk_rows=_read_int_min("READ_CHUNK_ROWS", 200_000, 1),
             # Ceiling on one line item's awarded value. Measured on a full
@@ -740,7 +733,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 ---
 
-### Task 3: `clean.py` — plausibilidade por quantidade
+### Task 3: `clean.py` — plausibilidade por valor
 
 **Files:**
 - Create: `src/pipeline/clean.py`
@@ -750,23 +743,76 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: o DataFrame de `load_raw()` (Task 2), `PipelineSettings` (Task 1)
 - Produces: `clean(df: pd.DataFrame, cfg: PipelineSettings) -> tuple[pd.DataFrame, pd.DataFrame]`.
   Devolve `(kept, quarantined)`. A quarentena tem todas as colunas de entrada
-  mais `motivo: str` e `z_quantidade: float`. Invariante:
-  `len(kept) + len(quarantined) == len(df)`.
-  Também exporta `REASON_QUANTITY` e `REASON_VALUE`. A coluna `motivo` da
-  quarentena recebe um dos dois; quando as duas regras disparam na mesma
-  linha, o rótulo é o de valor.
+  mais `motivo: str`. Invariante: `len(kept) + len(quarantined) == len(df)`.
+  Também exporta `REASON_VALUE: str`.
+
+**Por que a regra é esta, e não a que o spec trazia antes.** O desenho original
+media quantidade implausível dentro de cada `codigoClasse`, por z robusto sobre
+`log10`. Implementei, testei e rodei contra o ano inteiro — 1.440.492 itens
+homologados, R$ 732,7 bi — e ela reprovou em duas frentes:
+
+1. **Não pegava o maior erro.** A linha de 1.713.940 unidades de serviço postal
+   a R$ 132.000 cada, R$ 226 bilhões, 31% do total, tem `z = 3,41` contra um
+   limiar de 8. As linhas sem `codigoClasse` são 638.294 itens com quantidades
+   de 1 a 29 bilhões, e o MAD desse grupo é uma ordem de magnitude inteira.
+   Nenhum limiar separa: o que pega essa linha (3,0) remove 49,57% do valor.
+2. **O que ela pegava sozinha era legítimo.** Medido: 177 itens, R$ 0,31 bi,
+   0,04% do valor — e entre eles 28.000.000 doses de vacina (z 8,11), 8.800.000
+   munições (z 11,97) e 8.797 livros didáticos (z 8,16). Compras públicas de
+   grande escala, não erro de digitação. Os z dos falsos positivos se sobrepõem
+   aos dos verdadeiros, então não há limiar que salve.
+
+A absurdidade está no **produto**, não na quantidade: 1,7 milhão de unidades não
+chama atenção; 1,7 milhão de unidades a R$ 132.000 cada, sim. Inspecionei as 50
+linhas acima de R$ 500 mi: de R$ 500 mi a R$ 10 bi a faixa é majoritariamente
+legítima — merenda escolar a R$ 24 a refeição com 68 a 260 milhões de unidades,
+vacina a R$ 105 a dose, contratos bancários e concessões com quantidade 1. Acima
+de R$ 10 bi as 6 linhas são todas impossíveis.
+
+**Limitação assumida:** dois erros conhecidos ficam dentro — 867.796.000 kg de
+carne de caprino (R$ 3,3 bi) e 850.000 notebooks (R$ 4,4 bi). Juntos, 1% do
+total. Alcançá-los exigiria um teto que também removeria a merenda escolar.
+
+- [ ] **Step 0: acertar a configuração**
+
+`VALUE_CEILING` é consumido aqui, mas mora nos arquivos da Task 1, que já está
+commitada. As linhas exatas, para não haver dúvida — o brief de uma tarefa só
+extrai a seção dela, então elas ficam aqui e não lá.
+
+Em `src/classes/pipeline_settings.py`, no dataclass, depois de
+`read_chunk_rows`:
+
+```python
+    value_ceiling: float = 10_000_000_000.0  # R$ per line item
+```
+
+E em `from_env()`, depois da leitura de `READ_CHUNK_ROWS`:
+
+```python
+            # Ceiling on one line item's awarded value. Measured on a full
+            # year: R$ 10 bi removes 6 items out of 1.440.492 and all three
+            # audited legitimate contracts survive. Raising it lets the six
+            # impossible rows back in; lowering it towards R$ 500 mi starts
+            # taking the school meal programme.
+            value_ceiling=_read_float_min("VALUE_CEILING", 10_000_000_000.0, 1.0),
+```
+
+Se `qty_mad_threshold` ou `min_class_items` ainda estiverem no dataclass ou em
+`from_env()`, remova: a regra que os usava foi descartada e configuração morta é
+defeito. O mesmo para `QTY_MAD_THRESHOLD` e `MIN_CLASS_ITEMS` em `src/.env` e
+`src/.env.example`, onde `VALUE_CEILING=10000000000` deve existir. Preserve CRLF
+nos dois `.env`.
 
 - [ ] **Step 1: escrever o teste que falha**
 
 `tests/pipeline/test_clean.py`:
 
 ```python
-import numpy as np
 import pandas as pd
 import pytest
 
 from classes.pipeline_settings import PipelineSettings
-from pipeline.clean import REASON_QUANTITY, REASON_VALUE, clean
+from pipeline.clean import REASON_VALUE, clean
 
 
 @pytest.fixture
@@ -774,7 +820,7 @@ def cfg(tmp_path):
     return PipelineSettings(
         raw_csv=tmp_path / "x.csv", interim_dir=tmp_path,
         processed_dir=tmp_path, figures_dir=tmp_path,
-        qty_mad_threshold=8.0, min_class_items=30)
+        value_ceiling=10_000_000_000.0)
 
 
 def _frame(rows):
@@ -783,141 +829,97 @@ def _frame(rows):
         "quantidade", "valorUnitarioEstimado", "valorTotalResultado"])
 
 
-@pytest.fixture
-def base():
-    """40 compras normais de informática, para a classe ter mediana e MAD."""
-    rng = np.random.default_rng(7)
-    normais = [(f"n{i}", "7010", "Material", float(q), 2000.0, q * 2000.0)
-               for i, q in enumerate(rng.integers(1, 500, 40))]
-    return _frame(normais)
-
-
-def test_quarantines_impossible_quantity(cfg, base):
-    # o caso real: 11.880.000 tablets a R$ 1.550
-    suspect = _frame([("tablet", "7010", "Material",
-                        11_880_000.0, 1550.0, 18_414_000_000.0)])
-    kept, quarantined = clean(pd.concat([base, suspect], ignore_index=True), cfg)
-    assert list(quarantined["idCompraItem"]) == ["tablet"]
-    assert quarantined["motivo"].iloc[0] == REASON_QUANTITY
-    assert "tablet" not in set(kept["idCompraItem"])
-
-
-def test_legitimate_rows_survive(cfg, base):
-    # 50 ressonâncias a R$ 8,25 mi e 3.000 ambulâncias a R$ 277 mil
-    legitimate = _frame([
-        ("ressonancia", "7010", "Material", 50.0, 8_254_384.14, 303_286_600.0),
-        ("ambulancia", "7010", "Material", 3000.0, 277_807.0, 824_931_000.0),
+def test_quarantines_the_impossible_total(cfg):
+    """O caso real: 1.713.940 unidades de serviço postal a R$ 132.000 cada."""
+    entry = _frame([
+        ("normal", "7010", "Material", 10.0, 100.0, 1_000.0),
+        ("correios", None, "Serviço", 1_713_940.0, 132_000.0, 226_240_080_000.0),
     ])
-    kept, quarantined = clean(pd.concat([base, legitimate], ignore_index=True), cfg)
-    assert {"ressonancia", "ambulancia"} <= set(kept["idCompraItem"])
-    assert quarantined.empty
-
-
-def test_zero_mad_does_not_fire(cfg):
-    """Classe de serviço onde toda quantidade é 1: MAD = 0, regra não se aplica."""
-    services = _frame([(f"s{i}", "sem-classe", "Serviço", 1.0, 1000.0, 1000.0)
-                       for i in range(40)])
-    works = _frame([("obra", "sem-classe", "Serviço",
-                    1.0, 616_720_624.99, 604_989_321.0)])
-    kept, quarantined = clean(pd.concat([services, works], ignore_index=True), cfg)
-    assert quarantined.empty
-    assert "obra" in set(kept["idCompraItem"])
-
-
-def test_rule_is_one_sided(cfg, base):
-    """Quantidade muito BAIXA não é marcada: não infla total nenhum."""
-    tiny = _frame([("fracao", "7010", "Material", 0.001, 2000.0, 2.0)])
-    kept, quarantined = clean(pd.concat([base, tiny], ignore_index=True), cfg)
-    assert quarantined.empty
-    assert "fracao" in set(kept["idCompraItem"])
-
-
-def test_quarantines_an_impossible_total(cfg, base):
-    """O teto de valor pega o que a regra de quantidade não alcança.
-
-    O caso real: 34 unidades de perícia a R$ 3,2 bilhões cada. A quantidade é
-    banal — 34 —, então o z não dispara. O produto é impossível.
-    """
-    absurdo = _frame([("pericia", "7010", "Serviço",
-                       34.0, 3_197_501_483.0, 108_715_050_420.0)])
-    kept, quarantined = clean(pd.concat([base, absurdo], ignore_index=True), cfg)
-    assert list(quarantined["idCompraItem"]) == ["pericia"]
-    assert quarantined["motivo"].iloc[0] == REASON_VALUE
-    assert "pericia" not in set(kept["idCompraItem"])
-
-
-def test_value_ceiling_spares_audited_legitimate_contracts(cfg, base):
-    """Os três contratos que auditamos à mão sobrevivem ao teto."""
-    legitimos = _frame([
-        ("obras", "sem-classe", "Serviço", 1.0, 616_720_624.99, 604_989_321.0),
-        ("ambulancia", "7010", "Material", 3000.0, 277_807.0, 824_931_000.0),
-        ("ressonancia", "7010", "Material", 50.0, 8_254_384.14, 303_286_600.0),
-    ])
-    kept, quarantined = clean(pd.concat([base, legitimos], ignore_index=True), cfg)
-    assert {"obras", "ambulancia", "ressonancia"} <= set(kept["idCompraItem"])
-    assert quarantined.empty
-
-
-def test_value_wins_the_label_when_both_rules_fire(cfg, base):
-    """Quantidade absurda E valor absurdo na mesma linha: o rótulo é de valor.
-
-    O total impossível é a afirmação mais forte — vale independentemente de como
-    a quantidade se compara à classe dela.
-    """
-    ambos = _frame([("tablet", "7010", "Material",
-                     11_880_000.0, 1550.0, 18_414_000_000.0)])
-    _, quarantined = clean(pd.concat([base, ambos], ignore_index=True), cfg)
-    assert quarantined["motivo"].iloc[0] == REASON_VALUE
-
-
-def test_missing_class_rows_form_their_own_group(cfg):
-    """O `dropna=False` do groupby tem de estar lá, e este teste prova.
-
-    Sem ele o pandas descarta o grupo nulo, a mediana e o MAD dessas linhas
-    viram NaN, elas caem no ramo `no_spread` e ficam isentas da regra. Isso
-    importa porque 44,3% dos dados reais não têm codigoClasse. Os fixtures dos
-    outros testes usam a string "sem-classe", que agrupa como qualquer texto e
-    não distingue as duas implementações.
-
-    O valor aqui fica abaixo do teto de propósito, para o resultado ser
-    atribuível só à camada de quantidade.
-    """
-    rng = np.random.default_rng(11)
-    nulos = [(f"n{i}", None, "Serviço", float(q), 1.0, float(q))
-             for i, q in enumerate(rng.integers(1, 500, 40))]
-    absurdo = [("bilhao", None, "Serviço", 1e9, 1.0, 1e9)]
-    entry = _frame(nulos + absurdo)
-
     kept, quarantined = clean(entry, cfg)
+    assert list(quarantined["idCompraItem"]) == ["correios"]
+    assert quarantined["motivo"].iloc[0] == REASON_VALUE
+    assert list(kept["idCompraItem"]) == ["normal"]
 
-    assert list(quarantined["idCompraItem"]) == ["bilhao"]
-    assert quarantined["motivo"].iloc[0] == REASON_QUANTITY
-    assert "bilhao" not in set(kept["idCompraItem"])
+
+def test_spares_audited_legitimate_contracts(cfg):
+    """Os contratos que auditamos à mão, e a escala pública que parece absurda.
+
+    As três primeiras linhas são contratos reais grandes. As duas últimas são o
+    que a regra anterior colocava em quarentena por engano: 28 milhões de doses
+    de vacina e 8,8 milhões de munições não são erro de digitação.
+    """
+    entry = _frame([
+        ("obras", None, "Serviço", 1.0, 616_720_624.99, 604_989_321.0),
+        ("ambulancia", "7010", "Material", 3_000.0, 277_807.0, 824_931_000.0),
+        ("ressonancia", "7010", "Material", 50.0, 8_254_384.14, 303_286_600.0),
+        ("vacina", "6505", "Material", 28_000_000.0, 1.42, 39_760_000.0),
+        ("municao", "1305", "Material", 8_800_000.0, 2.62, 23_040_000.0),
+    ])
+    kept, quarantined = clean(entry, cfg)
+    assert quarantined.empty
+    assert len(kept) == 5
 
 
-def test_nothing_evaporates(cfg, base):
-    suspect = _frame([("tablet", "7010", "Material",
-                        11_880_000.0, 1550.0, 18_414_000_000.0)])
-    entry = pd.concat([base, suspect], ignore_index=True)
+def test_quantity_alone_never_quarantines(cfg):
+    """Quantidade enorme com total modesto passa — é compra em massa.
+
+    Esta é a regressão que importa: a regra anterior marcava estas linhas.
+    """
+    entry = _frame([
+        ("merenda", None, "Serviço", 250_800_000.0, 24.0, 6_019_200_000.0),
+        ("vale", None, "Serviço", 3_432_000_000.0, 3.0, 9_000_000_000.0),
+    ])
+    kept, quarantined = clean(entry, cfg)
+    assert quarantined.empty
+    assert len(kept) == 2
+
+
+def test_the_ceiling_is_exclusive(cfg):
+    """Exatamente no teto passa; um centavo acima, não."""
+    entry = _frame([
+        ("no_teto", "7010", "Material", 1.0, 1.0, 10_000_000_000.0),
+        ("acima", "7010", "Material", 1.0, 1.0, 10_000_000_000.01),
+    ])
+    kept, quarantined = clean(entry, cfg)
+    assert list(kept["idCompraItem"]) == ["no_teto"]
+    assert list(quarantined["idCompraItem"]) == ["acima"]
+
+
+def test_missing_value_is_kept(cfg):
+    """valorTotalResultado nulo não pode ser tratado como acima do teto."""
+    entry = _frame([("sem_valor", "7010", "Material", 5.0, 100.0, None)])
+    kept, quarantined = clean(entry, cfg)
+    assert quarantined.empty
+    assert len(kept) == 1
+
+
+def test_nothing_evaporates(cfg):
+    """A invariante que pegaria uma linha perdida no caminho."""
+    entry = _frame([
+        ("a", "7010", "Material", 1.0, 1.0, 1.0),
+        ("b", None, "Serviço", 1.0, 1.0, 226_240_080_000.0),
+        ("c", "8905", "Material", 2.0, 2.0, 4.0),
+    ])
     kept, quarantined = clean(entry, cfg)
     assert len(kept) + len(quarantined) == len(entry)
 
 
-def test_small_class_borrows_global_stats(cfg, base):
-    """Uma classe com 2 itens não tem MAD confiável; cai para o global."""
-    small = _frame([
-        ("p1", "9999", "Material", 5.0, 100.0, 500.0),
-        ("p2", "9999", "Material", 50_000_000.0, 100.0, 5_000_000_000.0),
+def test_reports_what_it_removed(cfg, capsys):
+    """Nada sai em silêncio: a mensagem diz quantos itens e quanto valor."""
+    entry = _frame([
+        ("ok", "7010", "Material", 1.0, 1.0, 1.0),
+        ("fora", None, "Serviço", 1.0, 1.0, 226_240_080_000.0),
     ])
-    kept, quarantined = clean(pd.concat([base, small], ignore_index=True), cfg)
-    assert "p2" in set(quarantined["idCompraItem"])
-    assert "p1" in set(kept["idCompraItem"])
+    clean(entry, cfg)
+    out = capsys.readouterr().out
+    assert "quarentena" in out
+    assert "1 item" in out
 ```
 
 - [ ] **Step 2: rodar e confirmar que falha**
 
 Run: `venv/bin/python -m pytest tests/pipeline/test_clean.py -v`
-Expected: FAIL com `ModuleNotFoundError: No module named 'pipeline.clean'`
+Expected: FAIL com `ImportError: cannot import name 'REASON_VALUE'`
 
 - [ ] **Step 3: implementar `clean.py`**
 
@@ -927,23 +929,29 @@ Expected: FAIL com `ModuleNotFoundError: No module named 'pipeline.clean'`
 """
 The plausibility filter, and the only stage that removes rows on judgement.
 
-The measured problem: eight rows out of 488.740 carry 78,7% of the value, and
-they are data entry errors at the source — 11.880.000 tablets, 867.796.000 kilos
-of goat meat, 1.713.940 units of postal service. Summing them annualises to
-R$ 2,6 trillion in federal line items, which is impossible.
+The measured problem: six rows out of 1.440.492 carry 53,77% of the total
+value, and they are data-entry errors at the source. The largest is 1.713.940
+units of postal service at R$ 132.000 each — R$ 226 bilhões, 31% of the dataset
+in one row. Left in, the year reads R$ 735 bi; taken out, R$ 340 bi.
 
-The errors live in the quantity, not in the total. Legitimate large contracts
-appear with quantity 1 (the whole contract in the unit price) or with dozens of
-units. That is why the rule reads quantity and not value: a ceiling on value
-would remove real road works and MRI scanners along with the typos.
+The rule reads the awarded total, not the quantity, because the absurdity is in
+the product. An earlier design measured implausible quantity within each class
+and was dropped after being measured against a full year: it missed that largest
+row entirely (z = 3,41 against a threshold of 8), and the 177 rows it caught on
+its own were legitimate public purchases at scale — 28 million vaccine doses,
+8,8 million rounds of ammunition, 8.797 textbooks. Quantity within a class does
+not separate bulk from typo.
 
-Nothing is deleted. Removed rows are returned as a second frame with the reason
+Known limitation, accepted: two real errors stay in — 867.796.000 kg of goat
+meat (R$ 3,3 bi) and 850.000 notebooks (R$ 4,4 bi), together 1% of the total.
+Reaching them would need a ceiling that also removes the school meal programme.
+
+Nothing is deleted. Removed rows come back as a second frame with the reason
 attached, so the caller can write them to data/interim/quarentena.parquet.
 """
 
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 
 from classes.pipeline_settings import PipelineSettings
@@ -951,100 +959,23 @@ from classes.pipeline_settings import PipelineSettings
 # number formatter for the package is one place to fix it.
 from pipeline.load import _pt_br
 
-REASON_QUANTITY = "quantidade implausível na classe"
 REASON_VALUE = "valor total implausível para um item de linha"
-
-# Scale factor that makes the median absolute deviation a consistent estimator
-# of the standard deviation for normally distributed data. Without it the
-# threshold would not be comparable to a z-score.
-MAD_SCALE = 1.4826
-
-
-def _mad(series: pd.Series) -> float:
-    """Median absolute deviation: a spread measure the outliers cannot inflate."""
-    return float((series - series.median()).abs().median())
 
 
 def clean(df: pd.DataFrame, cfg: PipelineSettings) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Splits the frame into (kept, quarantined). Removes nothing silently."""
-    work = df.copy()
+    # NaN > x is False, so an item that was never awarded a value is kept
+    # rather than treated as exceeding the ceiling.
+    suspect = df["valorTotalResultado"] > cfg.value_ceiling
 
-    # log10 because quantities span nine orders of magnitude, from 1 unit to
-    # 867 million. On the linear scale the median is meaningless.
-    work["_log_qtd"] = np.log10(
-        work["quantidade"].where(work["quantidade"] > 0)
-    )
+    quarantined = df[suspect].copy()
+    quarantined["motivo"] = REASON_VALUE
+    kept = df[~suspect]
 
-    # dropna=False keeps the missing-class rows as their own group: 19% of the
-    # data has no codigoClasse, and it includes the civil works contracts.
-    group = work.groupby("codigoClasse", dropna=False, observed=True)["_log_qtd"]
-    median = group.transform("median")
-    mad = group.transform(_mad)
-    size = group.transform("size")
-
-    global_median = work["_log_qtd"].median()
-    global_mad = _mad(work["_log_qtd"].dropna())
-
-    # A class whose quantities are all identical has MAD 0, and dividing by it
-    # would flag every row that differs at all. Service classes are like this —
-    # quantity is 1 on nearly every contract — and they are exactly where the
-    # legitimate R$ 604 million works sit. The rule simply does not apply there.
-    no_spread = mad.isna() | (mad == 0)
-
-    # A class with a handful of items has a median and a MAD, but neither means
-    # anything. Borrow the global distribution instead.
-    small_class = (size < cfg.min_class_items) & ~no_spread
-
-    effective_median = median.where(~small_class, global_median)
-    effective_mad = mad.where(~small_class, global_mad)
-
-    z = (work["_log_qtd"] - effective_median) / (MAD_SCALE * effective_mad)
-
-    # One-sided on purpose. A quantity that is too small understates a total and
-    # cannot produce the R$ 226 billion artefact; and quantity 1 is the norm for
-    # works and continuing services. Only the high tail is suspect.
-    # NaN comparisons are False, so rows without a usable quantity are kept.
-    suspect_quantity = (z > cfg.qty_mad_threshold) & ~no_spread
-    if global_mad == 0:
-        # Degenerate input: every quantity in the frame is identical.
-        suspect_quantity = pd.Series(False, index=work.index)
-
-    # Second layer, and the one that catches the dominant errors. Measured
-    # against a full year: the quantity rule alone misses the largest row in
-    # the dataset — 1.713.940 units of postal service at R$ 132.000 each,
-    # R$ 226 bilhoes, 31% of the total. Its z is 3,41, because the rows with no
-    # class form a group of 638.294 items spanning quantities from 1 to 29
-    # bilhoes, whose MAD is a full order of magnitude. No z threshold separates
-    # that row: the one that catches it (3,0) also removes 49,57% of the value.
-    #
-    # The absurdity is in the PRODUCT, not the quantity. 1,7 million units is
-    # unremarkable; 1,7 million units at R$ 132.000 each is not. So the second
-    # rule reads the awarded total, and it is the cheapest cut in the pipeline:
-    # 6 items out of 1.440.492, with every audited legitimate contract intact.
-    suspect_value = work["valorTotalResultado"] > cfg.value_ceiling
-
-    suspect = suspect_quantity | suspect_value
-
-    # The value rule wins the label when both fire, because it is the stronger
-    # statement: a total this large is impossible regardless of how the
-    # quantity compares to its class.
-    reason = pd.Series(pd.NA, index=work.index, dtype="string")
-    reason[suspect_quantity] = REASON_QUANTITY
-    reason[suspect_value] = REASON_VALUE
-
-    quarantined = work[suspect].copy()
-    quarantined["motivo"] = reason[suspect]
-    quarantined["z_quantidade"] = z[suspect]
-
-    kept = work[~suspect].drop(columns="_log_qtd")
-    quarantined = quarantined.drop(columns="_log_qtd")
-
-    for label, mask in ((REASON_VALUE, suspect_value),
-                        (REASON_QUANTITY, suspect_quantity & ~suspect_value)):
-        if mask.any():
-            total = work.loc[mask, "valorTotalResultado"].sum()
-            print(f"{_pt_br(int(mask.sum()))} item(ns) em quarentena — {label} — "
-                  f"somando R$ {_pt_br(total, 2)}.")
+    if len(quarantined):
+        total = quarantined["valorTotalResultado"].sum()
+        print(f"{_pt_br(len(quarantined))} item(ns) em quarentena — {REASON_VALUE} "
+              f"— somando R$ {_pt_br(total, 2)}.")
 
     return kept.reset_index(drop=True), quarantined.reset_index(drop=True)
 ```
@@ -1052,13 +983,13 @@ def clean(df: pd.DataFrame, cfg: PipelineSettings) -> tuple[pd.DataFrame, pd.Dat
 - [ ] **Step 4: rodar e confirmar que passa**
 
 Run: `venv/bin/python -m pytest tests/pipeline/test_clean.py -v`
-Expected: 6 passed
+Expected: 7 passed
 
 - [ ] **Step 5: commit**
 
 ```bash
-git add src/pipeline/clean.py tests/pipeline/test_clean.py
-git commit -m "feat(pipeline): filtro de plausibilidade por quantidade na classe
+git add src/pipeline/clean.py tests/pipeline/test_clean.py         src/classes/pipeline_settings.py src/.env src/.env.example
+git commit -m "feat(pipeline): filtro de plausibilidade por valor total
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```

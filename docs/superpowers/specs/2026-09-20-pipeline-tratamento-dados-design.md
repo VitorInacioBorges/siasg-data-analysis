@@ -91,9 +91,12 @@ numa classe `PipelineSettings` irmã de `Settings`.
 |---|---|---|
 | `PANEL_FREQ` | `W` | grão temporal do painel |
 | `TOP_CLASSES` | `50` | classes mantidas; o resto vira `"Outras"` |
-| `QTY_MAD_THRESHOLD` | `8` | corte de plausibilidade, em z robusto |
-| `MIN_CLASS_ITEMS` | `30` | abaixo disso a classe não tem MAD confiável |
+| `VALUE_CEILING` | `10000000000` | teto do valor de um item de linha, em reais |
 | `STATUS_FILTER` | `Homologado` | situação considerada gasto efetivo |
+| `READ_CHUNK_ROWS` | `200000` | linhas lidas por fatia do CSV bruto |
+| `DATA_DIR` | `data` | raiz das três camadas |
+| `RAW_CSV_NAME` | `contract_items.csv` | nome do CSV que o coletor grava |
+| `FIGURES_DIR` | `reports/figures` | onde os PNG são gravados |
 
 Manter no `.env` respeita a regra do projeto e é o que torna ampliar a janela uma
 mudança de configuração, não de código.
@@ -117,54 +120,60 @@ filtra por `STATUS_FILTER`. Devolve o grão de item.
 def limpar(df: pd.DataFrame, cfg: PipelineSettings) -> tuple[pd.DataFrame, pd.DataFrame]
 ```
 
-A limpeza tem **duas camadas**, e a segunda foi acrescentada depois de medir a
-primeira contra o ano inteiro.
+A limpeza tem **uma regra**, e chegar a ela custou implementar e descartar outra.
 
-**Camada 1 — quantidade implausível dentro da classe:**
-
-```
-z = (log10(quantidade) − mediana_da_classe) / (1.4826 × MAD_da_classe)
-suspeito se z > QTY_MAD_THRESHOLD
-```
-
-**Camada 2 — valor total implausível para um item de linha:**
+**Regra: valor total implausível para um item de linha.**
 
 ```
 suspeito se valorTotalResultado > VALUE_CEILING     (padrão R$ 10 bi)
 ```
 
-Por que a segunda existe: a camada 1, sozinha, **não pega a maior linha da
-base** — 1.713.940 unidades de serviço postal a R$ 132.000 cada, R$ 226
-bilhões, 31% do total. O z dela é 3,41, porque as linhas sem `codigoClasse`
-formam um grupo de 638.294 itens com quantidades de 1 a 29 bilhões, cujo MAD é
-uma ordem de magnitude inteira. Nenhum limiar de z separa esse caso: o que pega
-essa linha (3,0) remove também 49,57% do valor e 11.122 itens. Limitar o MAD por
-um teto dá o mesmo resultado, e um teto de quantidade não alcança 1,7 milhão de
-unidades sem levar 47,5% do valor junto.
+Medido no ano inteiro — 1.440.492 itens homologados, R$ 732,7 bi — o teto remove
+**6 itens** (0,0004%) que carregam 53,77% do valor, e todos os seis são
+impossíveis: R$ 226 bilhões de serviço postal, R$ 3,2 bilhões por unidade de
+perícia, R$ 10 bilhões por uma unidade de consultoria, 3,4 bilhões de unidades a
+R$ 3. Sem o teto o ano lê R$ 735 bi; com ele, R$ 340 bi.
 
-A absurdidade está no **produto**, não na quantidade: 1,7 milhão de unidades não
-chama atenção; 1,7 milhão de unidades a R$ 132.000 cada, sim. Medido no ano
-inteiro, o teto de R$ 10 bi remove **6 itens de 1.440.492** — 0,0004% — e os três
-contratos legítimos auditados (obras civis R$ 604 mi, ambulâncias R$ 824 mi,
-ressonância R$ 303 mi) sobrevivem a qualquer dos tetos testados. As doze maiores
-linhas são todas impossíveis, inclusive R$ 3,2 bilhões por unidade de perícia e
-R$ 10 bilhões por uma unidade de consultoria.
+### A regra que foi descartada, e por quê
 
-As duas camadas se complementam: o teto pega o produto absurdo, e o z pega a
-quantidade absurda dentro de uma classe coerente — foi ele que pegou os
-11.880.000 tablets e os 6.264.000 notebooks, que o teto de R$ 10 bi não
-alcançaria.
+O desenho aprovado no brainstorming media **quantidade implausível dentro de
+cada `codigoClasse`**, por z robusto sobre `log10`, com limiar 8 e fallback para
+a estatística global em classes pequenas. Foi implementada, testada com seis
+casos e rodada contra os dados reais. Reprovou em duas frentes independentes:
 
-Três propriedades decidem se a regra funciona:
+**Não pegava o maior erro.** A linha de 1.713.940 unidades de serviço postal a
+R$ 132.000 cada tem `z = 3,41`. As linhas sem `codigoClasse` são 638.294 itens —
+44,3% da base — com quantidades de 1 a 29 bilhões, e o MAD desse grupo é uma
+ordem de magnitude inteira. Nenhum limiar separa o caso: o que pega essa linha
+(3,0) remove 49,57% do valor e 11.122 itens. Limitar o MAD por um teto dá o
+mesmo resultado, e um teto de quantidade não alcança 1,7 milhão de unidades sem
+levar 47,51% junto.
 
-- **Unilateral.** Só quantidade alta dispara. Quantidade baixa não infla o
-  total, e `quantidade = 1` é o normal em obra e serviço continuado — os
-  legítimos a preservar.
-- **MAD zero não dispara.** Em classes de serviço quase toda quantidade é 1, o
-  MAD é 0 e o z explodiria. A regra não se aplica ali, o que é conservador e
-  correto: é onde estão as obras civis de R$ 604 milhões.
-- **Classe pequena cai para o global.** Abaixo de `MIN_CLASS_ITEMS` a mediana e
-  o MAD não são confiáveis.
+**O que pegava sozinha era legítimo.** Medido: 177 itens, R$ 0,31 bi, 0,04% do
+valor. Entre eles, 28.000.000 doses de vacina (z 8,11), 8.800.000 munições
+(z 11,97) e 8.797 livros didáticos (z 8,16). Compras públicas de grande escala,
+não erro de digitação. Os z dos falsos positivos (8,11 a 11,97) se sobrepõem aos
+dos verdadeiros, então não existe limiar que salve a regra.
+
+A lição, que vale para o resto do projeto: **quantidade dentro de uma classe não
+separa compra em massa legítima de erro de digitação.** A absurdidade está no
+produto. 1,7 milhão de unidades não chama atenção; 1,7 milhão de unidades a
+R$ 132.000 cada, sim.
+
+### Onde o teto fica, e por que não desce
+
+Inspecionadas as 50 linhas acima de R$ 500 mi: de R$ 500 mi a R$ 10 bi a faixa é
+majoritariamente **legítima** — merenda escolar a R$ 24 a refeição com 68 a 260
+milhões de unidades, vacina contra dengue a R$ 105 a dose, contratos bancários,
+concessões e obras civis com `quantidade = 1`. Acima de R$ 10 bi as seis linhas
+são todas impossíveis. Descer o teto começa a remover programa público real.
+
+### Limitação assumida
+
+Dois erros conhecidos ficam dentro: 867.796.000 kg de carne de caprino
+(R$ 3,3 bi) e 850.000 notebooks (R$ 4,4 bi). Juntos, 1% do total. Alcançá-los
+exigiria um teto que também removeria a merenda escolar — um erro pior que o que
+corrige.
 
 Devolve as duas metades. Nada é apagado em silêncio.
 
