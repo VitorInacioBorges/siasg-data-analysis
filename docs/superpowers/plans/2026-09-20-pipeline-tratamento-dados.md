@@ -457,7 +457,10 @@ def load_raw(path: Path, cfg: PipelineSettings) -> pd.DataFrame:
     for column in NUMERIC_COLUMNS:
         # errors="coerce": an empty cell becomes NaN instead of raising. Items
         # that were never awarded have no valorTotalResultado at all.
-        df[column] = pd.to_numeric(df[column], errors="coerce")
+        # astype("float64"): to_numeric alone returns int64 when every value in
+        # the column happens to be a whole number, which breaks the promise
+        # that these columns are always float64.
+        df[column] = pd.to_numeric(df[column], errors="coerce").astype("float64")
 
     # The API writes class codes as floats ("7010.0"). They are identifiers.
     if "codigoClasse" in df.columns:
