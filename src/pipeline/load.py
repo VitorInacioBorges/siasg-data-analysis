@@ -5,8 +5,21 @@ Does three things and only three: deduplicate, drop the dead columns, filter by
 status. Anything that requires a judgement call about the data belongs in
 clean.py — this module's job is to hand the next stage a typed, honest frame.
 
-The raw CSV may be several hundred megabytes and may be mid-write while the
-collector runs, so it is read in slices and tolerant of a truncated last line.
+The raw CSV is several hundred megabytes — 859 MB and 3,5 million rows as
+measured — and may be mid-write while the collector runs, so the read tolerates
+a truncated last line.
+
+What "tolerant" means precisely, because the obvious reading is wrong: pandas
+skips a row with extra fields, NaN-pads a row with missing fields, and raises
+outright if a truncation lands inside a quoted field. Only the first of those
+is `on_bad_lines`. So the module checks for a partial last row itself, drops it,
+and turns the parser error into a message that names the cause.
+
+A note on `chunksize`, so nobody reads more into it than is there: the frame is
+concatenated immediately, because deduplicating needs a whole-file view and
+duplicates cross chunk boundaries. So the slices do not bound peak memory here
+— they only change how the parser is invoked. The honest floor for this
+function is one full frame in memory.
 """
 
 from __future__ import annotations
@@ -35,6 +48,62 @@ CATEGORY_COLUMNS = ["materialOuServicoNome", "materialOuServico", "unidadeMedida
                      "situacaoCompraItemNome", "nomeFornecedor"]
 
 
+def _pt_br(number: float, decimals: int = 0) -> str:
+    """Formats a number the way the messages around it are written.
+
+    Python's own thousands separator is the comma and its decimal mark the
+    period — the opposite of Brazilian convention. Every message in this
+    module is Portuguese, so "3.517.673" and "23,4%" are what the reader
+    expects, not "3,517,673" and "23.4%".
+    """
+    texto = f"{number:,.{decimals}f}"
+    return texto.replace(",", "\x00").replace(".", ",").replace("\x00", ".")
+
+
+def _snapshot(path: Path) -> tuple[int, int]:
+    """Size and mtime — the pair that says whether the file moved.
+
+    Its own function so a test can replace it deterministically, instead of
+    patching Path.stat and catching every incidental call.
+    """
+    info = path.stat()
+    return info.st_size, info.st_mtime_ns
+
+
+def _ends_mid_row(path: Path) -> bool:
+    """True when the file does not end in a newline — its last row is partial.
+
+    This is the only reliable signal that the collector was cut off mid-write,
+    and it matters because pandas cannot tell. Measured against pandas 3.0.5:
+    `on_bad_lines="skip"` discards a row with EXTRA fields, but a row with
+    MISSING fields — which is what a truncated line is — gets NaN-padded and
+    kept. The newline count cannot see it either, since an unterminated line
+    contributes no newline byte, so the skipped-line comparison stays silent
+    and the half row reaches the panel.
+
+    CsvWriter writes through the csv module, which always emits a line
+    terminator, so for this pipeline's own raw file a missing final newline
+    means truncation and nothing else.
+    """
+    with path.open("rb") as handle:
+        if handle.seek(0, 2) == 0:
+            return False          # empty file: nothing to be partial
+        handle.seek(-1, 2)
+        return handle.read(1) != b"\n"
+
+
+def _count_lines(path: Path) -> int:
+    """Counts newlines in 8 MiB blocks — four times faster than iterating lines.
+
+    Measured on the real 859 MB file: 0,39s by blocks against 1,51s by lines.
+    """
+    total = 0
+    with path.open("rb") as handle:
+        while (block := handle.read(8 << 20)):
+            total += block.count(b"\n")
+    return total
+
+
 def load_raw(path: Path, cfg: PipelineSettings) -> pd.DataFrame:
     """Reads the raw CSV, deduplicates it, and returns the item grain."""
     if not path.exists():
@@ -42,28 +111,71 @@ def load_raw(path: Path, cfg: PipelineSettings) -> pd.DataFrame:
             f"{path} não existe. Rode o coletor primeiro: python src/main.py"
         )
 
+    # Snapshot taken before both passes and compared after them. The skipped
+    # line count subtracts two numbers produced by two separate reads, so it is
+    # only meaningful if the file did not change in between — and the collector
+    # appending mid-read is exactly the case this module claims to tolerate.
+    # Without this guard, rows appended between the passes would be reported as
+    # malformed: a false alarm in the one scenario the warning exists for.
+    before = _snapshot(path)
+    in_file = _count_lines(path) - 1  # minus the header
+    partial_tail = _ends_mid_row(path)
+
     slices = pd.read_csv(
         path,
         encoding="utf-8-sig",
         chunksize=cfg.read_chunk_rows,
-        # The collector may be appending right now, leaving the last line half
-        # written. Skipping it is right; doing so silently is not — the count
-        # is reported below.
+        # Catches rows with EXTRA fields. Rows with missing fields are
+        # NaN-padded instead, which is why _ends_mid_row exists.
         on_bad_lines="skip",
         parse_dates=["dataInclusaoPncp"],
         dtype={c: "string" for c in TEXT_COLUMNS},
         low_memory=False,
     )
-    df = pd.concat(list(slices), ignore_index=True)
+    try:
+        frames = list(slices)
+    except pd.errors.ParserError as error:
+        # Truncation landing inside a quoted field raises instead of skipping,
+        # and on_bad_lines does not catch it. A clear message beats a traceback
+        # the reader has to decode.
+        raise RuntimeError(
+            f"O CSV bruto ficou ilegível a partir de algum ponto ({error}). "
+            f"Isso acontece quando o coletor é interrompido no meio de um campo "
+            f"entre aspas. Espere o coletor terminar, ou rode-o de novo com "
+            f"RESUME=true para completar o arquivo."
+        ) from None
+    df = pd.concat(frames, ignore_index=True)
 
-    read_rows = len(df)
-    # One extra pass over the file, a few seconds, to tell a skipped line from a
-    # line that was never there.
-    with path.open("rb") as fh:
-        in_file = sum(1 for _ in fh) - 1
-    if in_file > read_rows:
-        print(f"Aviso: {in_file - read_rows:,} linha(s) do CSV foram puladas por "
-              f"estarem malformadas (provavelmente a última, se o coletor está rodando).")
+    # Whether the file moved is decided BEFORE anything acts on the earlier
+    # measurements, because all of them came from separate reads. Acting first
+    # and disclaiming afterwards is what the previous version did, and it
+    # discarded a legitimate row whenever the collector finished its write
+    # during the parse: the drop had already happened by the time the warning
+    # printed.
+    changed = _snapshot(path) != before
+
+    if changed:
+        # No check before or after the parse is exact on a file being appended
+        # to — a post-parse check only moves the window, it does not close it.
+        # Two orderings, two opposite wrong answers, and nothing distinguishes
+        # them from here. So the honest move is to act on none of it.
+        print("Aviso: o arquivo mudou durante a leitura — o coletor está rodando? "
+              "Nem a contagem de linhas puladas nem a detecção de linha parcial "
+              "valem para esta execução, e nenhuma linha foi descartada por "
+              "isso. Rode de novo quando a coleta terminar.")
+    else:
+        # Nothing moved, so both measurements describe the bytes pandas parsed.
+        # The partial row goes before anything counts it: NaN-padded and with
+        # its id intact, it would survive dedup, add zero to every sum, and
+        # quietly understate the panel.
+        if partial_tail and len(df):
+            df = df.iloc[:-1]
+            print("Aviso: a última linha do CSV estava pela metade e foi "
+                  "descartada (o coletor foi interrompido?).")
+        skipped = in_file - len(df)
+        if skipped > 0:
+            print(f"Aviso: {_pt_br(skipped)} linha(s) do CSV foram puladas por "
+                  f"estarem malformadas.")
 
     df = df.drop(columns=[c for c in DEAD_COLUMNS if c in df.columns])
 
@@ -72,9 +184,12 @@ def load_raw(path: Path, cfg: PipelineSettings) -> pd.DataFrame:
     # idCompraItem is the API's unique key.
     before = len(df)
     df = df.drop_duplicates("idCompraItem", keep="first")
-    if before > len(df):
-        print(f"{before - len(df):,} linha(s) duplicada(s) removida(s) "
-              f"({(before - len(df)) / before:.1%} do arquivo).")
+    # `before > 0` guards a header-only file, where the percentage would divide
+    # by zero.
+    if before > 0 and before > len(df):
+        removed = before - len(df)
+        print(f"{_pt_br(removed)} linha(s) duplicada(s) removida(s) "
+              f"({_pt_br(removed / before * 100, 1)}% do arquivo).")
 
     for column in NUMERIC_COLUMNS:
         # errors="coerce": an empty cell becomes NaN instead of raising. Items
@@ -90,13 +205,16 @@ def load_raw(path: Path, cfg: PipelineSettings) -> pd.DataFrame:
                               .str.replace(r"\.0$", "", regex=True)
                               .astype("string"))
 
+    before = len(df)
+    df = df[df["situacaoCompraItemNome"] == cfg.status_filter]
+    print(f"{_pt_br(before - len(df))} linha(s) fora de '{cfg.status_filter}' "
+          f"removida(s); {_pt_br(len(df))} restantes.")
+
+    # Category conversion comes after the filter on purpose: converting first
+    # would leave "Fracassado" and the other discarded statuses as dead
+    # categories in the dtype's metadata.
     for column in CATEGORY_COLUMNS:
         if column in df.columns:
             df[column] = df[column].astype("category")
-
-    before = len(df)
-    df = df[df["situacaoCompraItemNome"] == cfg.status_filter]
-    print(f"{before - len(df):,} linha(s) fora de '{cfg.status_filter}' removida(s); "
-          f"{len(df):,} restantes.")
 
     return df.reset_index(drop=True)
