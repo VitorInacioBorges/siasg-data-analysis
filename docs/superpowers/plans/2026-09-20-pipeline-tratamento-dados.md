@@ -325,8 +325,11 @@ def cfg(tmp_path):
     path.parent.mkdir(parents=True)
     path.write_text(
         HEADER
-        + _row("a1")
-        + _row("a1")                          # duplicata exata
+        + _row("a1", qtd="10")
+        # Mesma chave, quantidade diferente. Deliberado: se as duas linhas
+        # fossem idênticas, um drop_duplicates() SEM subset passaria no teste
+        # igualmente, e o teste não provaria nada sobre a chave.
+        + _row("a1", qtd="99")
         + _row("a2")
         + _row("a3", status="Fracassado")     # filtrada pelo status
         , encoding="utf-8-sig")
@@ -337,9 +340,19 @@ def cfg(tmp_path):
 
 
 def test_drops_duplicate_ids(cfg):
+    """A deduplicação é pela CHAVE, não pela linha inteira.
+
+    As duas linhas "a1" do fixture diferem em `quantidade`, então um
+    `drop_duplicates()` sem subset deixaria as duas e este teste falharia. É o
+    caso real: 23,4% do arquivo são re-downloads de um bloco interrompido, e
+    nada garante que o valor de um item não mudou entre as tentativas.
+    """
     df = load_raw(cfg.raw_csv, cfg)
     assert df["idCompraItem"].is_unique
     assert set(df["idCompraItem"]) == {"a1", "a2"}
+    # keep="first": a linha mantida é a primeira que apareceu no arquivo
+    mantida = df[df["idCompraItem"] == "a1"]["quantidade"].iloc[0]
+    assert mantida == 10.0, "esperava a primeira ocorrência, não a segunda"
 
 
 def test_drops_the_three_dead_columns(cfg):
@@ -359,6 +372,38 @@ def test_types_and_normalisation(cfg):
     assert pd.api.types.is_datetime64_any_dtype(df["dataInclusaoPncp"])
     # o CSV traz "7010.0"; o código é identificador, não número
     assert df["codigoClasse"].iloc[0] == "7010"
+
+
+def test_reports_skipped_lines(tmp_path, capsys):
+    """Uma linha malformada é pulada — e o aviso tem de dizer quantas.
+
+    O CSV pode estar sendo escrito pelo coletor, então a última linha vem pela
+    metade. Pular é certo; pular em silêncio é perda de dado sem rastro.
+    """
+    path = tmp_path / "raw" / "contract_items.csv"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        HEADER
+        + _row("b1")
+        + "b2,2025-09-22T00:04:59,7010,Material,Homologado\n"   # colunas faltando
+        + _row("b3"),
+        encoding="utf-8-sig")
+    cfg = PipelineSettings(
+        raw_csv=path, interim_dir=tmp_path / "i",
+        processed_dir=tmp_path / "p", figures_dir=tmp_path / "f")
+
+    df = load_raw(path, cfg)
+
+    assert set(df["idCompraItem"]) == {"b1", "b3"}
+    saida = capsys.readouterr().out
+    assert "puladas" in saida
+    assert "1 linha" in saida
+
+
+def test_no_message_when_nothing_is_skipped(cfg, capsys):
+    """O caminho silencioso também precisa ser afirmado, não só acontecer."""
+    load_raw(cfg.raw_csv, cfg)
+    assert "puladas" not in capsys.readouterr().out
 
 
 def test_missing_file_gives_a_clear_message(cfg, tmp_path):
@@ -383,8 +428,15 @@ Does three things and only three: deduplicate, drop the dead columns, filter by
 status. Anything that requires a judgement call about the data belongs in
 clean.py — this module's job is to hand the next stage a typed, honest frame.
 
-The raw CSV may be several hundred megabytes and may be mid-write while the
-collector runs, so it is read in slices and tolerant of a truncated last line.
+The raw CSV is several hundred megabytes — 859 MB and 3,5 million rows as
+measured — and may be mid-write while the collector runs, so the read tolerates
+a truncated last line.
+
+A note on `chunksize`, so nobody reads more into it than is there: the frame is
+concatenated immediately, because deduplicating needs a whole-file view and
+duplicates cross chunk boundaries. So the slices do not bound peak memory here
+— they only change how the parser is invoked. The honest floor for this
+function is one full frame in memory.
 """
 
 from __future__ import annotations
@@ -413,12 +465,45 @@ CATEGORY_COLUMNS = ["materialOuServicoNome", "materialOuServico", "unidadeMedida
                      "situacaoCompraItemNome", "nomeFornecedor"]
 
 
+def _pt_br(number: float, decimals: int = 0) -> str:
+    """Formats a number the way the messages around it are written.
+
+    Python's own thousands separator is the comma and its decimal mark the
+    period — the opposite of Brazilian convention. Every message in this
+    module is Portuguese, so "3.517.673" and "23,4%" are what the reader
+    expects, not "3,517,673" and "23.4%".
+    """
+    texto = f"{number:,.{decimals}f}"
+    return texto.replace(",", "\x00").replace(".", ",").replace("\x00", ".")
+
+
+def _count_lines(path: Path) -> int:
+    """Counts newlines in 8 MiB blocks — four times faster than iterating lines.
+
+    Measured on the real 859 MB file: 0,39s by blocks against 1,51s by lines.
+    """
+    total = 0
+    with path.open("rb") as handle:
+        while (block := handle.read(8 << 20)):
+            total += block.count(b"\n")
+    return total
+
+
 def load_raw(path: Path, cfg: PipelineSettings) -> pd.DataFrame:
     """Reads the raw CSV, deduplicates it, and returns the item grain."""
     if not path.exists():
         raise FileNotFoundError(
             f"{path} não existe. Rode o coletor primeiro: python src/main.py"
         )
+
+    # Snapshot taken before both passes and compared after them. The skipped
+    # line count subtracts two numbers produced by two separate reads, so it is
+    # only meaningful if the file did not change in between — and the collector
+    # appending mid-read is exactly the case this module claims to tolerate.
+    # Without this guard, rows appended between the passes would be reported as
+    # malformed: a false alarm in the one scenario the warning exists for.
+    before_stat = path.stat()
+    in_file = _count_lines(path) - 1  # minus the header
 
     slices = pd.read_csv(
         path,
@@ -435,13 +520,16 @@ def load_raw(path: Path, cfg: PipelineSettings) -> pd.DataFrame:
     df = pd.concat(list(slices), ignore_index=True)
 
     read_rows = len(df)
-    # One extra pass over the file, a few seconds, to tell a skipped line from a
-    # line that was never there.
-    with path.open("rb") as fh:
-        in_file = sum(1 for _ in fh) - 1
-    if in_file > read_rows:
-        print(f"Aviso: {in_file - read_rows:,} linha(s) do CSV foram puladas por "
-              f"estarem malformadas (provavelmente a última, se o coletor está rodando).")
+    after_stat = path.stat()
+    changed = ((before_stat.st_size, before_stat.st_mtime_ns)
+               != (after_stat.st_size, after_stat.st_mtime_ns))
+    if changed:
+        print("Aviso: o arquivo mudou durante a leitura — o coletor está rodando? "
+              "A contagem de linhas puladas não é confiável nesta execução.")
+    elif in_file > read_rows:
+        print(f"Aviso: {_pt_br(in_file - read_rows)} linha(s) do CSV foram puladas "
+              f"por estarem malformadas (provavelmente a última, se o coletor "
+              f"estava rodando).")
 
     df = df.drop(columns=[c for c in DEAD_COLUMNS if c in df.columns])
 
@@ -450,9 +538,12 @@ def load_raw(path: Path, cfg: PipelineSettings) -> pd.DataFrame:
     # idCompraItem is the API's unique key.
     before = len(df)
     df = df.drop_duplicates("idCompraItem", keep="first")
-    if before > len(df):
-        print(f"{before - len(df):,} linha(s) duplicada(s) removida(s) "
-              f"({(before - len(df)) / before:.1%} do arquivo).")
+    # `before > 0` guards a header-only file, where the percentage would divide
+    # by zero.
+    if before > 0 and before > len(df):
+        removed = before - len(df)
+        print(f"{_pt_br(removed)} linha(s) duplicada(s) removida(s) "
+              f"({_pt_br(removed / before * 100, 1)}% do arquivo).")
 
     for column in NUMERIC_COLUMNS:
         # errors="coerce": an empty cell becomes NaN instead of raising. Items
@@ -468,14 +559,17 @@ def load_raw(path: Path, cfg: PipelineSettings) -> pd.DataFrame:
                               .str.replace(r"\.0$", "", regex=True)
                               .astype("string"))
 
+    before = len(df)
+    df = df[df["situacaoCompraItemNome"] == cfg.status_filter]
+    print(f"{_pt_br(before - len(df))} linha(s) fora de '{cfg.status_filter}' "
+          f"removida(s); {_pt_br(len(df))} restantes.")
+
+    # Category conversion comes after the filter on purpose: converting first
+    # would leave "Fracassado" and the other discarded statuses as dead
+    # categories in the dtype's metadata.
     for column in CATEGORY_COLUMNS:
         if column in df.columns:
             df[column] = df[column].astype("category")
-
-    before = len(df)
-    df = df[df["situacaoCompraItemNome"] == cfg.status_filter]
-    print(f"{before - len(df):,} linha(s) fora de '{cfg.status_filter}' removida(s); "
-          f"{len(df):,} restantes.")
 
     return df.reset_index(drop=True)
 ```
