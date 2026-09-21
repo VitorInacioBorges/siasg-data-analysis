@@ -58,7 +58,7 @@ pyarrow, pytest.
   `status_filter: str`, `read_chunk_rows: int`, e o
   construtor `PipelineSettings.from_env() -> PipelineSettings`
 
-- [ ] **Step 1: instalar as dependências e registrá-las**
+- [x] **Step 1: instalar as dependências e registrá-las**
 
 ```bash
 cd /home/vitor_inacio_borges/siasg-data-analysis
@@ -74,7 +74,7 @@ pytest>=8.0
 EOF
 ```
 
-- [ ] **Step 2: acrescentar as chaves ao `.env` e ao `.env.example`**
+- [x] **Step 2: acrescentar as chaves ao `.env` e ao `.env.example`**
 
 Ao fim dos dois arquivos (o `.env` usa CRLF — preserve):
 
@@ -104,7 +104,7 @@ FIGURES_DIR=reports/figures
 VALUE_CEILING=10000000000
 ```
 
-- [ ] **Step 3: escrever o teste que falha**
+- [x] **Step 3: escrever o teste que falha**
 
 `tests/conftest.py`:
 
@@ -186,12 +186,12 @@ def test_rejects_top_classes_zero(monkeypatch):
         assert "TOP_CLASSES" in str(error)
 ```
 
-- [ ] **Step 4: rodar e confirmar que falha**
+- [x] **Step 4: rodar e confirmar que falha**
 
 Run: `venv/bin/python -m pytest tests/test_pipeline_settings.py -v`
 Expected: FAIL com `ModuleNotFoundError: No module named 'classes.pipeline_settings'`
 
-- [ ] **Step 5: implementar `PipelineSettings`**
+- [x] **Step 5: implementar `PipelineSettings`**
 
 `src/classes/pipeline_settings.py`:
 
@@ -269,12 +269,12 @@ class PipelineSettings:
         )
 ```
 
-- [ ] **Step 6: rodar e confirmar que passa**
+- [x] **Step 6: rodar e confirmar que passa**
 
 Run: `venv/bin/python -m pytest tests/test_pipeline_settings.py -v`
 Expected: 4 passed
 
-- [ ] **Step 7: commit**
+- [x] **Step 7: commit**
 
 ```bash
 git add requirements.txt pytest.ini tests/conftest.py \
@@ -304,7 +304,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
   Também exporta as constantes `DEAD_COLUMNS: list[str]`,
   `NUMERIC_COLUMNS: list[str]` e `TEXT_COLUMNS: list[str]`.
 
-- [ ] **Step 1: escrever o teste que falha**
+- [x] **Step 1: escrever o teste que falha**
 
 `tests/pipeline/test_load.py`:
 
@@ -520,12 +520,12 @@ def test_missing_file_gives_a_clear_message(cfg, tmp_path):
         load_raw(tmp_path / "nao-existe.csv", cfg)
 ```
 
-- [ ] **Step 2: rodar e confirmar que falha**
+- [x] **Step 2: rodar e confirmar que falha**
 
 Run: `venv/bin/python -m pytest tests/pipeline/test_load.py -v`
 Expected: FAIL com `ModuleNotFoundError: No module named 'pipeline'`
 
-- [ ] **Step 3: implementar `load.py`**
+- [x] **Step 3: implementar `load.py`**
 
 `src/pipeline/load.py`:
 
@@ -759,12 +759,12 @@ def load_raw(path: Path, cfg: PipelineSettings) -> pd.DataFrame:
     return df.reset_index(drop=True)
 ```
 
-- [ ] **Step 4: rodar e confirmar que passa**
+- [x] **Step 4: rodar e confirmar que passa**
 
 Run: `venv/bin/python -m pytest tests/pipeline/test_load.py -v`
 Expected: 5 passed
 
-- [ ] **Step 5: commit**
+- [x] **Step 5: commit**
 
 ```bash
 git add src/pipeline/load.py tests/pipeline/test_load.py
@@ -815,7 +815,7 @@ de R$ 10 bi as 6 linhas são todas impossíveis.
 carne de caprino (R$ 3,3 bi) e 850.000 notebooks (R$ 4,4 bi). Juntos, 1% do
 total. Alcançá-los exigiria um teto que também removeria a merenda escolar.
 
-- [ ] **Step 0: acertar a configuração**
+- [x] **Step 0: acertar a configuração**
 
 `VALUE_CEILING` é consumido aqui, mas mora nos arquivos da Task 1, que já está
 commitada. As linhas exatas, para não haver dúvida — o brief de uma tarefa só
@@ -845,7 +845,7 @@ defeito. O mesmo para `QTY_MAD_THRESHOLD` e `MIN_CLASS_ITEMS` em `src/.env` e
 `src/.env.example`, onde `VALUE_CEILING=10000000000` deve existir. Preserve CRLF
 nos dois `.env`.
 
-- [ ] **Step 1: escrever o teste que falha**
+- [x] **Step 1: escrever o teste que falha**
 
 `tests/pipeline/test_clean.py`:
 
@@ -958,12 +958,12 @@ def test_reports_what_it_removed(cfg, capsys):
     assert "1 item" in out
 ```
 
-- [ ] **Step 2: rodar e confirmar que falha**
+- [x] **Step 2: rodar e confirmar que falha**
 
 Run: `venv/bin/python -m pytest tests/pipeline/test_clean.py -v`
 Expected: FAIL com `ImportError: cannot import name 'REASON_VALUE'`
 
-- [ ] **Step 3: implementar `clean.py`**
+- [x] **Step 3: implementar `clean.py`**
 
 `src/pipeline/clean.py`:
 
@@ -1022,12 +1022,12 @@ def clean(df: pd.DataFrame, cfg: PipelineSettings) -> tuple[pd.DataFrame, pd.Dat
     return kept.reset_index(drop=True), quarantined.reset_index(drop=True)
 ```
 
-- [ ] **Step 4: rodar e confirmar que passa**
+- [x] **Step 4: rodar e confirmar que passa**
 
 Run: `venv/bin/python -m pytest tests/pipeline/test_clean.py -v`
 Expected: 7 passed
 
-- [ ] **Step 5: commit**
+- [x] **Step 5: commit**
 
 ```bash
 git add src/pipeline/clean.py tests/pipeline/test_clean.py         src/classes/pipeline_settings.py src/.env src/.env.example
@@ -1054,7 +1054,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
   `n_weeks × n_combinações` linhas. Também exporta
   `BUCKET_OTHER: str = "Outras"` e `BUCKET_NO_CLASS: str = "Sem classe"`.
 
-- [ ] **Step 1: escrever o teste que falha**
+- [x] **Step 1: escrever o teste que falha**
 
 `tests/pipeline/test_aggregate.py`:
 
@@ -1151,12 +1151,12 @@ def test_discount_rate(cfg):
     assert linha["taxa_desconto"] == pytest.approx(0.8)
 ```
 
-- [ ] **Step 2: rodar e confirmar que falha**
+- [x] **Step 2: rodar e confirmar que falha**
 
 Run: `venv/bin/python -m pytest tests/pipeline/test_aggregate.py -v`
 Expected: FAIL com `ModuleNotFoundError: No module named 'pipeline.aggregate'`
 
-- [ ] **Step 3: implementar `aggregate.py`**
+- [x] **Step 3: implementar `aggregate.py`**
 
 `src/pipeline/aggregate.py`:
 
@@ -1246,12 +1246,12 @@ def to_panel(df: pd.DataFrame, cfg: PipelineSettings) -> pd.DataFrame:
     return panel.sort_values(["semana"] + key[1:]).reset_index(drop=True)
 ```
 
-- [ ] **Step 4: rodar e confirmar que passa**
+- [x] **Step 4: rodar e confirmar que passa**
 
 Run: `venv/bin/python -m pytest tests/pipeline/test_aggregate.py -v`
 Expected: 6 passed
 
-- [ ] **Step 5: commit**
+- [x] **Step 5: commit**
 
 ```bash
 git add src/pipeline/aggregate.py tests/pipeline/test_aggregate.py
@@ -1282,7 +1282,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
   nunca uma constante paralela — com `PANEL_FREQ=M` a defasagem anual se chama
   `valor_lag_12`, e uma lista fixa apontaria para colunas que não existem.
 
-- [ ] **Step 1: escrever o teste que falha**
+- [x] **Step 1: escrever o teste que falha**
 
 `tests/pipeline/test_features.py`:
 
@@ -1366,12 +1366,12 @@ def test_monthly_frequency_renames_the_annual_lag(cfg, panel):
     assert "valor_lag_52" in numeric_features(cfg)
 ```
 
-- [ ] **Step 2: rodar e confirmar que falha**
+- [x] **Step 2: rodar e confirmar que falha**
 
 Run: `venv/bin/python -m pytest tests/pipeline/test_features.py -v`
 Expected: FAIL com `ModuleNotFoundError: No module named 'pipeline.features'`
 
-- [ ] **Step 3: implementar `features.py`**
+- [x] **Step 3: implementar `features.py`**
 
 `src/pipeline/features.py`:
 
@@ -1485,12 +1485,12 @@ def build_features(panel: pd.DataFrame, cfg: PipelineSettings) -> pd.DataFrame:
     return out.sort_values(["semana"] + COMBO_KEY).reset_index(drop=True)
 ```
 
-- [ ] **Step 4: rodar e confirmar que passa**
+- [x] **Step 4: rodar e confirmar que passa**
 
 Run: `venv/bin/python -m pytest tests/pipeline/test_features.py -v`
 Expected: 5 passed
 
-- [ ] **Step 5: commit**
+- [x] **Step 5: commit**
 
 ```bash
 git add src/pipeline/features.py tests/pipeline/test_features.py
@@ -1513,7 +1513,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
   rendendo pares de arrays de índices posicionais de linha, compatíveis com
   `cross_val_score(cv=...)` do scikit-learn.
 
-- [ ] **Step 1: escrever o teste que falha**
+- [x] **Step 1: escrever o teste que falha**
 
 `tests/pipeline/test_split.py`:
 
@@ -1560,12 +1560,12 @@ def test_rejects_too_many_folds(panel):
         list(split_by_week(panel, n_splits=20))
 ```
 
-- [ ] **Step 2: rodar e confirmar que falha**
+- [x] **Step 2: rodar e confirmar que falha**
 
 Run: `venv/bin/python -m pytest tests/pipeline/test_split.py -v`
 Expected: FAIL com `ModuleNotFoundError: No module named 'pipeline.split'`
 
-- [ ] **Step 3: implementar `split.py`**
+- [x] **Step 3: implementar `split.py`**
 
 `src/pipeline/split.py`:
 
@@ -1612,12 +1612,12 @@ def split_by_week(panel: pd.DataFrame, n_splits: int) -> Iterator[tuple[np.ndarr
         yield train, test
 ```
 
-- [ ] **Step 4: rodar e confirmar que passa**
+- [x] **Step 4: rodar e confirmar que passa**
 
 Run: `venv/bin/python -m pytest tests/pipeline/test_split.py -v`
 Expected: 5 passed
 
-- [ ] **Step 5: commit**
+- [x] **Step 5: commit**
 
 ```bash
 git add src/pipeline/split.py tests/pipeline/test_split.py
@@ -1639,7 +1639,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Produces: `build_transformer(cfg: PipelineSettings) -> ColumnTransformer`,
   **não ajustado**, para ser embutido num `sklearn.pipeline.Pipeline`.
 
-- [ ] **Step 1: escrever o teste que falha**
+- [x] **Step 1: escrever o teste que falha**
 
 `tests/pipeline/test_transform.py`:
 
@@ -1710,12 +1710,12 @@ def test_nan_features_do_not_break(cfg, X):
     assert not np.isnan(out).any()
 ```
 
-- [ ] **Step 2: rodar e confirmar que falha**
+- [x] **Step 2: rodar e confirmar que falha**
 
 Run: `venv/bin/python -m pytest tests/pipeline/test_transform.py -v`
 Expected: FAIL com `ModuleNotFoundError: No module named 'pipeline.transform'`
 
-- [ ] **Step 3: implementar `transform.py`**
+- [x] **Step 3: implementar `transform.py`**
 
 `src/pipeline/transform.py`:
 
@@ -1777,12 +1777,12 @@ def build_transformer(cfg: PipelineSettings) -> ColumnTransformer:
     )
 ```
 
-- [ ] **Step 4: rodar e confirmar que passa**
+- [x] **Step 4: rodar e confirmar que passa**
 
 Run: `venv/bin/python -m pytest tests/pipeline/test_transform.py -v`
 Expected: 4 passed
 
-- [ ] **Step 5: commit**
+- [x] **Step 5: commit**
 
 ```bash
 git add src/pipeline/transform.py tests/pipeline/test_transform.py
@@ -1817,7 +1817,7 @@ não substituir sem revalidar com `scripts/validate_palette.js`):
 | `03-composicao-material-servico.png` | barras empilhadas por semana | composição ao longo do tempo, duas categorias |
 | `04-quarantined.png` | barras horizontais | magnitude por motivo, com rótulo direto no valor |
 
-- [ ] **Step 1: escrever o teste que falha**
+- [x] **Step 1: escrever o teste que falha**
 
 `tests/pipeline/test_plots.py`:
 
@@ -1866,12 +1866,12 @@ def test_empty_quarantine_does_not_break(data, tmp_path):
     assert len(paths) == 4
 ```
 
-- [ ] **Step 2: rodar e confirmar que falha**
+- [x] **Step 2: rodar e confirmar que falha**
 
 Run: `venv/bin/python -m pytest tests/pipeline/test_plots.py -v`
 Expected: FAIL com `ModuleNotFoundError: No module named 'pipeline.plots'`
 
-- [ ] **Step 3: implementar `plots.py`**
+- [x] **Step 3: implementar `plots.py`**
 
 `src/pipeline/plots.py`:
 
@@ -2038,12 +2038,12 @@ def make_figures(raw_items: pd.DataFrame, kept_items: pd.DataFrame, panel: pd.Da
     return paths
 ```
 
-- [ ] **Step 4: rodar e confirmar que passa**
+- [x] **Step 4: rodar e confirmar que passa**
 
 Run: `venv/bin/python -m pytest tests/pipeline/test_plots.py -v`
 Expected: 2 passed
 
-- [ ] **Step 5: olhar os gráficos**
+- [x] **Step 5: olhar os gráficos**
 
 O validador confere cor, não geometria. Gere as figuras com dados reais e
 abra-as, procurando rótulo sobreposto, eixo cortado e estouro:
@@ -2069,7 +2069,7 @@ for c in gerar_graficos(bruto, limpo, painel, Path("reports/figures"),
 EOF
 ```
 
-- [ ] **Step 6: commit**
+- [x] **Step 6: commit**
 
 ```bash
 git add src/pipeline/plots.py tests/pipeline/test_plots.py
@@ -2093,7 +2093,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
   `data/interim/quarantined.parquet`, `data/processed/panel.parquet`,
   `data/processed/painel_features.parquet` e os PNG em `reports/figures/`.
 
-- [ ] **Step 1: escrever o teste que falha**
+- [x] **Step 1: escrever o teste que falha**
 
 `tests/test_prepare.py`:
 
@@ -2158,12 +2158,12 @@ def test_panel_sum_matches_the_kept_items(environment):
         kept["valorTotalResultado"].sum())
 ```
 
-- [ ] **Step 2: rodar e confirmar que falha**
+- [x] **Step 2: rodar e confirmar que falha**
 
 Run: `venv/bin/python -m pytest tests/test_prepare.py -v`
 Expected: FAIL com `ModuleNotFoundError: No module named 'prepare'`
 
-- [ ] **Step 3: implementar `prepare.py`**
+- [x] **Step 3: implementar `prepare.py`**
 
 `src/prepare.py`:
 
@@ -2309,12 +2309,12 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
-- [ ] **Step 4: rodar e confirmar que passa**
+- [x] **Step 4: rodar e confirmar que passa**
 
 Run: `venv/bin/python -m pytest tests/test_prepare.py -v`
 Expected: 4 passed
 
-- [ ] **Step 5: rodar a suíte inteira e o pipeline nos dados reais**
+- [x] **Step 5: rodar a suíte inteira e o pipeline nos dados reais**
 
 ```bash
 venv/bin/python -m pytest -v
@@ -2324,7 +2324,7 @@ cd /home/vitor_inacio_borges/siasg-data-analysis && venv/bin/python src/prepare.
 Expected: todos os testes passam; o pipeline imprime o número de duplicatas
 removidas, os itens em quarentena, o tamanho do painel e as quatro figuras.
 
-- [ ] **Step 6: commit**
+- [x] **Step 6: commit**
 
 ```bash
 git add src/prepare.py tests/test_prepare.py
