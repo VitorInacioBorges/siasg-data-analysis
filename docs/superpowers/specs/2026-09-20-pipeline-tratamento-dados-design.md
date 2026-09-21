@@ -175,6 +175,13 @@ def criar_features(painel: pd.DataFrame, cfg: PipelineSettings) -> pd.DataFrame
 Calendário (semana do ano, mês, seno e cosseno), tendência linear, médias
 móveis, defasagens. Toda feature olha só para trás.
 
+O comprimento do ciclo sazonal e a defasagem anual derivam de
+`cfg.panel_freq`, não de um 52 cravado: com `PANEL_FREQ=M` a defasagem anual é
+12, e um valor fixo calcularia um ciclo doze vezes longo demais. O módulo
+também exporta `colunas_numericas(cfg) -> list[str]`, que é a **única** fonte
+dos nomes das features numéricas — `transform.py` pede a lista em vez de
+carregar uma constante paralela, para que os dois não possam divergir.
+
 ### `src/pipeline/split.py`
 
 ```python

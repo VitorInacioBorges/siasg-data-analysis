@@ -143,6 +143,13 @@ def test_caminhos_derivam_da_raiz_de_dados(monkeypatch):
     assert cfg.processed_dir.as_posix() == "/tmp/dados-teste/processed"
 
 
+def test_env_e_ancorado_no_modulo():
+    """O .env precisa ser achado mesmo sem arquivo chamador (python -c, pytest)."""
+    from classes.pipeline_settings import CAMINHO_ENV
+    assert CAMINHO_ENV.name == ".env"
+    assert CAMINHO_ENV.parent.name == "src"
+
+
 def test_recusa_top_classes_zero(monkeypatch):
     monkeypatch.setenv("TOP_CLASSES", "0")
     try:
@@ -181,7 +188,17 @@ from dotenv import load_dotenv
 
 from read_type_methods import _read_float_min, _read_int_min, _read_text
 
-load_dotenv()
+# Anchored to this file, not to the caller's frame. `load_dotenv()` with no
+# argument walks up from whoever called it, and under `python -c` there is no
+# calling file at all — it falls back to the working directory, finds nothing,
+# and every value silently becomes the dataclass default. Measured: a .env
+# saying MAX_WORKERS=2 read back as 3. For a data pipeline that is the worst
+# kind of failure, because the run succeeds with the wrong configuration.
+CAMINHO_ENV = Path(__file__).resolve().parent.parent / ".env"
+if CAMINHO_ENV.exists():
+    load_dotenv(CAMINHO_ENV)
+else:
+    print(f"Aviso: {CAMINHO_ENV} não existe; usando apenas os valores padrão.")
 
 
 @dataclass
@@ -920,8 +937,12 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
   `mes` (int), `sazonal_sen` (float), `sazonal_cos` (float),
   `valor_lag_1`, `valor_lag_4`, `valor_lag_52`, `itens_lag_1`, `itens_lag_4`,
   `itens_lag_52`, `valor_media_4`, `itens_media_4`. Também exporta
-  `COLUNAS_CATEGORICAS: list[str]` e `COLUNAS_NUMERICAS_FEATURE: list[str]`,
-  consumidas pela Task 7.
+  `COLUNAS_CATEGORICAS: list[str]` e a função
+  `colunas_numericas(cfg: PipelineSettings) -> list[str]`, que devolve os nomes
+  das features numéricas que `criar_features` produz para a frequência
+  configurada. A Task 7 consome as duas. Há uma fonte de verdade só: a função,
+  nunca uma constante paralela — com `PANEL_FREQ=M` a defasagem anual se chama
+  `valor_lag_12`, e uma lista fixa apontaria para colunas que não existem.
 
 - [ ] **Step 1: escrever o teste que falha**
 
@@ -932,7 +953,7 @@ import pandas as pd
 import pytest
 
 from classes.pipeline_settings import PipelineSettings
-from pipeline.features import (COLUNAS_CATEGORICAS, COLUNAS_NUMERICAS_FEATURE,
+from pipeline.features import (COLUNAS_CATEGORICAS, colunas_numericas,
                                criar_features)
 
 
@@ -992,9 +1013,19 @@ def test_features_de_calendario(cfg, painel):
 
 
 def test_listas_de_colunas_existem_na_saida(cfg, painel):
+    """Tudo que colunas_numericas() promete precisa existir de fato."""
     saida = criar_features(painel, cfg)
-    for coluna in COLUNAS_CATEGORICAS + COLUNAS_NUMERICAS_FEATURE:
+    for coluna in COLUNAS_CATEGORICAS + colunas_numericas(cfg):
         assert coluna in saida.columns, coluna
+
+
+def test_frequencia_mensal_muda_o_nome_da_defasagem_anual(cfg, painel):
+    """A razão de a lista ser função e não constante."""
+    import dataclasses
+    mensal = dataclasses.replace(cfg, panel_freq="M")
+    assert "valor_lag_12" in colunas_numericas(mensal)
+    assert "valor_lag_52" not in colunas_numericas(mensal)
+    assert "valor_lag_52" in colunas_numericas(cfg)
 ```
 
 - [ ] **Step 2: rodar e confirmar que falha**
@@ -1033,18 +1064,31 @@ from classes.pipeline_settings import PipelineSettings
 # Consumed by transform.py to build the ColumnTransformer.
 COLUNAS_CATEGORICAS = ["materialOuServicoNome", "classe"]
 
-COLUNAS_NUMERICAS_FEATURE = [
-    "tendencia", "semana_do_ano", "mes", "sazonal_sen", "sazonal_cos",
-    "qtd_total", "qtd_mediana", "preco_unitario_mediano",
-    "n_fornecedores", "n_orgaos", "taxa_desconto",
-    "valor_lag_1", "valor_lag_4", "valor_lag_52",
-    "itens_lag_1", "itens_lag_4", "itens_lag_52",
-    "valor_media_4", "itens_media_4",
-]
-
 CHAVE_COMBO = ["materialOuServicoNome", "classe"]
-DEFASAGENS = (1, 4, 52)
+
+# Periods in one year, per panel frequency. This is what makes the seasonal
+# cycle and the annual lag follow PANEL_FREQ instead of assuming weeks: with a
+# hardcoded 52 a monthly panel would compute a twelve-times-too-long cycle and
+# an annual lag that reaches four years back.
+PERIODOS_POR_ANO = {"W": 52, "M": 12, "Q": 4, "D": 365}
+PERIODOS_POR_ANO_PADRAO = 52
+
+# Short lags for the near horizon; the annual one is added from the frequency.
+DEFASAGENS_CURTAS = (1, 4)
 JANELA_MEDIA = 4
+
+
+def colunas_numericas(cfg: PipelineSettings) -> list[str]:
+    """The numeric feature names criar_features() produces for this frequency."""
+    periodos = PERIODOS_POR_ANO.get(cfg.panel_freq.upper()[:1], PERIODOS_POR_ANO_PADRAO)
+    fixas = ["tendencia", "semana_do_ano", "mes", "sazonal_sen", "sazonal_cos",
+             "qtd_total", "qtd_mediana", "preco_unitario_mediano",
+             "n_fornecedores", "n_orgaos", "taxa_desconto",
+             "valor_media_4", "itens_media_4"]
+    defasadas = [f"{alvo}_lag_{d}"
+                 for d in DEFASAGENS_CURTAS + (periodos,)
+                 for alvo in ("valor", "itens")]
+    return fixas + defasadas
 
 
 def criar_features(painel: pd.DataFrame, cfg: PipelineSettings) -> pd.DataFrame:
@@ -1057,7 +1101,17 @@ def criar_features(painel: pd.DataFrame, cfg: PipelineSettings) -> pd.DataFrame:
     tempo = saida["semana"].dt.to_timestamp()
     saida["semana_do_ano"] = tempo.dt.isocalendar().week.astype(int)
     saida["mes"] = tempo.dt.month
-    angulo = 2 * np.pi * saida["semana_do_ano"] / 52.0
+
+    # The cycle length comes from the configured frequency, so the sine and
+    # cosine describe one real year whatever the panel's grain.
+    frequencia = cfg.panel_freq.upper()[:1]
+    periodos = PERIODOS_POR_ANO.get(frequencia)
+    if periodos is None:
+        print(f"Aviso: PANEL_FREQ={cfg.panel_freq!r} não está no mapa de períodos; "
+              f"assumindo {PERIODOS_POR_ANO_PADRAO} períodos por ano.")
+        periodos = PERIODOS_POR_ANO_PADRAO
+
+    angulo = 2 * np.pi * saida["semana_do_ano"] / periodos
     saida["sazonal_sen"] = np.sin(angulo)
     saida["sazonal_cos"] = np.cos(angulo)
 
@@ -1070,7 +1124,7 @@ def criar_features(painel: pd.DataFrame, cfg: PipelineSettings) -> pd.DataFrame:
     # stops the lag of one class from reaching into another's history — without
     # it, the first week of class B would inherit the last week of class A.
     grupos = saida.groupby(CHAVE_COMBO, observed=True)
-    for defasagem in DEFASAGENS:
+    for defasagem in DEFASAGENS_CURTAS + (periodos,):
         saida[f"valor_lag_{defasagem}"] = grupos["valor_total"].shift(defasagem)
         saida[f"itens_lag_{defasagem}"] = grupos["n_itens"].shift(defasagem)
 
@@ -1083,7 +1137,8 @@ def criar_features(painel: pd.DataFrame, cfg: PipelineSettings) -> pd.DataFrame:
                               .transform(lambda s: s.shift(1)
                                          .rolling(JANELA_MEDIA).mean()))
 
-    vazias = [c for c in saida.columns if c.endswith("_52") and saida[c].isna().all()]
+    vazias = [c for c in saida.columns
+              if c.endswith(f"_{periodos}") and saida[c].isna().all()]
     if vazias:
         print(f"Aviso: {', '.join(vazias)} está(ão) inteiramente vazia(s) — o painel "
               f"tem {saida['semana'].nunique()} semanas, menos que a defasagem de 52. "
@@ -1242,7 +1297,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Test: `tests/pipeline/test_transform.py`
 
 **Interfaces:**
-- Consumes: `COLUNAS_CATEGORICAS` e `COLUNAS_NUMERICAS_FEATURE` (Task 5)
+- Consumes: `COLUNAS_CATEGORICAS` e `colunas_numericas(cfg)` (Task 5)
 - Produces: `montar_transformador(cfg: PipelineSettings) -> ColumnTransformer`,
   **não ajustado**, para ser embutido num `sklearn.pipeline.Pipeline`.
 
@@ -1258,7 +1313,7 @@ from sklearn.linear_model import Ridge
 from sklearn.pipeline import Pipeline
 
 from classes.pipeline_settings import PipelineSettings
-from pipeline.features import COLUNAS_CATEGORICAS, COLUNAS_NUMERICAS_FEATURE
+from pipeline.features import COLUNAS_CATEGORICAS, colunas_numericas
 from pipeline.transform import montar_transformador
 
 
@@ -1270,9 +1325,9 @@ def cfg(tmp_path):
 
 
 @pytest.fixture
-def X():
+def X(cfg):
     n = 20
-    dados = {c: np.arange(n, dtype=float) for c in COLUNAS_NUMERICAS_FEATURE}
+    dados = {c: np.arange(n, dtype=float) for c in colunas_numericas(cfg)}
     dados["materialOuServicoNome"] = ["Material", "Serviço"] * (n // 2)
     dados["classe"] = ["A", "B", "C", "D"] * (n // 4)
     return pd.DataFrame(dados)
@@ -1281,7 +1336,7 @@ def X():
 def test_categoricas_viram_colunas_binarias(cfg, X):
     saida = montar_transformador(cfg).fit_transform(X)
     # 2 valores de material/serviço + 4 classes + as numéricas
-    assert saida.shape[1] == 2 + 4 + len(COLUNAS_NUMERICAS_FEATURE)
+    assert saida.shape[1] == 2 + 4 + len(colunas_numericas(cfg))
 
 
 def test_categoria_nova_no_teste_nao_quebra(cfg, X):
@@ -1302,7 +1357,9 @@ def test_scaler_ajustado_so_no_treino(cfg, X):
     scaler = (modelo.named_steps["prep"]
               .named_transformers_["num"].named_steps["escala"])
     esperado = treino["tendencia"].mean()
-    indice = COLUNAS_NUMERICAS_FEATURE.index("tendencia")
+    # O índice vem da mesma lista que o transformador recebeu, não de uma
+    # constante paralela que poderia estar em outra ordem.
+    indice = colunas_numericas(cfg).index("tendencia")
     assert scaler.mean_[indice] == pytest.approx(esperado)
     assert scaler.mean_[indice] != pytest.approx(X["tendencia"].mean())
 
@@ -1346,7 +1403,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from classes.pipeline_settings import PipelineSettings
-from pipeline.features import COLUNAS_CATEGORICAS, COLUNAS_NUMERICAS_FEATURE
+from pipeline.features import COLUNAS_CATEGORICAS, colunas_numericas
 
 
 def montar_transformador(cfg: PipelineSettings) -> ColumnTransformer:
@@ -1371,7 +1428,9 @@ def montar_transformador(cfg: PipelineSettings) -> ColumnTransformer:
 
     return ColumnTransformer(
         [
-            ("num", numericas, COLUNAS_NUMERICAS_FEATURE),
+            # Asked of features.py rather than hardcoded, so the annual lag's
+            # name follows PANEL_FREQ and the two modules cannot drift apart.
+            ("num", numericas, colunas_numericas(cfg)),
             ("cat", categoricas, COLUNAS_CATEGORICAS),
         ],
         # Anything not named is dropped: the targets and the key columns must
