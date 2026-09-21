@@ -31,6 +31,45 @@ Uma janela de um ano sem filtros são aproximadamente **5 milhões de itens em
 cerca de 10.000 requisições**, e é por isso que gravar em fluxo e marcar
 progresso não são extras opcionais aqui.
 
+## Do CSV ao painel
+
+O projeto tem duas etapas independentes. O coletor acima produz o CSV bruto; o
+pipeline de tratamento o transforma num painel semanal pronto para um modelo
+consumir.
+
+```bash
+python src/prepare.py
+```
+
+Os estágios rodam em ordem, e cada um deixa seu artefato em disco:
+
+| Estágio | O que faz | O que grava |
+|---|---|---|
+| `load` | Lê o CSV com tipos, deduplica e filtra por situação | — (em memória) |
+| `clean` | Aplica o teto de valor por item, com quarentena | `data/interim/itens_limpos.parquet`, `data/interim/quarentena.parquet` |
+| `aggregate` | Muda o grão para semana × material/serviço × classe | `data/processed/painel.parquet` |
+| `features` | Calendário, tendência, defasagens e médias móveis | `data/processed/painel_features.parquet` |
+| `plots` | As quatro figuras | `reports/figures/*.png` |
+
+Use `--ate` para parar em um estágio, o que é útil para inspecionar um passo
+antes de seguir:
+
+```bash
+python src/prepare.py --ate clean
+```
+
+Medido sobre o arquivo real de 859 MB, com 3.299.572 linhas: 582.385
+duplicatas removidas, 1.276.695 linhas fora de `Homologado`, **6 itens em
+quarentena somando R$ 394 bilhões**, e um painel de 2.809 linhas (53 semanas ×
+53 combinações). A execução inteira leva cerca de 20 segundos e chega a 3,1 GB
+de memória.
+
+Aqueles 6 itens são erros de digitação na origem que carregam mais da metade
+do valor do conjunto. O maior é 1.713.940 unidades de serviço postal a
+R$ 132.000 cada. É por isso que a primeira figura mostra a série bruta e a
+limpa lado a lado: a diferença entre elas é a decisão mais consequente do
+pipeline.
+
 ## Documentação
 
 A documentação é mantida em dois idiomas com estrutura idêntica.
@@ -57,6 +96,9 @@ cp src/.env.example src/.env
 
 # 4. Rode o coletor
 python src/main.py
+
+# 5. Prepare o painel a partir do CSV coletado
+python src/prepare.py
 ```
 
 Antes da coleta completa, vale um ensaio curto com uma janela de duas semanas:
@@ -89,14 +131,31 @@ atualizada sem repetir o ano inteiro.
 ```
 siasg-data-analysis/
 ├── README.md
+├── requirements.txt
 ├── src/
-│   ├── main.py                 # orquestração: coleta, nova tentativa, resumo
+│   ├── main.py                 # coletor: baixa a API e grava o CSV bruto
+│   ├── prepare.py              # pipeline: do CSV bruto ao painel semanal
 │   ├── read_type_methods.py    # leitores tipados para valores do .env
 │   ├── .env.example            # template documentado do .env
-│   └── classes/
-│       ├── settings.py         # configuração validada de uma execução
-│       ├── csv_writer.py       # gravação de CSV em fluxo
-│       └── checkpoint.py       # controle de retomada após interrupção
+│   ├── classes/
+│   │   ├── settings.py         # configuração do coletor
+│   │   ├── pipeline_settings.py # configuração do pipeline
+│   │   ├── csv_writer.py       # gravação de CSV em fluxo
+│   │   └── checkpoint.py       # controle de retomada após interrupção
+│   └── pipeline/
+│       ├── load.py             # leitura tipada e deduplicação
+│       ├── clean.py            # teto de valor, com quarentena
+│       ├── aggregate.py        # muda o grão para o painel semanal
+│       ├── features.py         # calendário, tendência e defasagens
+│       ├── split.py            # corte temporal que não parte a semana
+│       ├── transform.py        # ColumnTransformer não ajustado
+│       └── plots.py            # as quatro figuras
+├── tests/
+├── data/
+│   ├── raw/                    # a testemunha: nunca editada
+│   ├── interim/                # itens limpos e quarentena
+│   └── processed/              # painel e painel com features
+├── reports/figures/            # os PNG
 └── docs/
     ├── english/
     └── portuguese/
@@ -105,8 +164,16 @@ siasg-data-analysis/
 ## Requisitos
 
 - Python 3.9 ou posterior
-- `requests`, `pandas` e `python-dotenv`
+- Coletor: `requests`, `pandas` e `python-dotenv`
+- Pipeline: `matplotlib`, `scikit-learn` e `pyarrow`, além dos acima
+- Testes: `pytest`
 - Sem chave de API: o endpoint é público
+
+Tudo de uma vez, com as versões fixadas:
+
+```bash
+pip install -r requirements.txt
+```
 
 ## Licença e fonte dos dados
 
@@ -153,6 +220,45 @@ An unfiltered one-year window is roughly **5 million items across about 10,000
 requests**, which is why streaming and checkpointing are not optional extras
 here.
 
+<a name="from-csv-to-panel"></a>
+
+## From CSV to panel
+
+The project has two independent stages. The collector above produces the raw
+CSV; the preparation pipeline turns it into a weekly panel a model can consume.
+
+```bash
+python src/prepare.py
+```
+
+The stages run in order, and each one leaves its artefact on disk:
+
+| Stage | What it does | What it writes |
+|---|---|---|
+| `load` | Reads the CSV with types, deduplicates, and filters by status | — (in memory) |
+| `clean` | Applies the per-item value ceiling, with quarantine | `data/interim/itens_limpos.parquet`, `data/interim/quarentena.parquet` |
+| `aggregate` | Changes the grain to week × material/service × class | `data/processed/painel.parquet` |
+| `features` | Calendar, trend, lags, and rolling means | `data/processed/painel_features.parquet` |
+| `plots` | The four figures | `reports/figures/*.png` |
+
+Use `--ate` to stop at a stage, which helps when you want to inspect one step
+before going further:
+
+```bash
+python src/prepare.py --ate clean
+```
+
+Measured on the real 859 MB file, with 3,299,572 rows: 582,385 duplicates
+removed, 1,276,695 rows outside `Homologado`, **6 items quarantined totalling
+R$ 394 billion**, and a panel of 2,809 rows (53 weeks × 53 combinations). The
+whole run takes about 20 seconds and peaks at 3.1 GB of memory.
+
+Those 6 items are data-entry errors at the source that carry more than half of
+the dataset's value. The largest is 1,713,940 units of postal service at
+R$ 132,000 each. That is why the first figure shows the raw and the cleaned
+series side by side: the gap between them is the most consequential decision
+in the pipeline.
+
 <a name="documentation"></a>
 
 ## Documentation
@@ -183,6 +289,9 @@ cp src/.env.example src/.env
 
 # 4. Run the collector
 python src/main.py
+
+# 5. Prepare the panel from the collected CSV
+python src/prepare.py
 ```
 
 Before the full collection, a short two-week rehearsal is worth the minute it
@@ -219,14 +328,31 @@ the collection current without repeating the whole year.
 ```
 siasg-data-analysis/
 ├── README.md
+├── requirements.txt
 ├── src/
-│   ├── main.py                 # orchestration: collect, retry, summarize
+│   ├── main.py                 # collector: downloads the API into a raw CSV
+│   ├── prepare.py              # pipeline: raw CSV to weekly panel
 │   ├── read_type_methods.py    # typed readers for .env values
 │   ├── .env.example            # documented template for .env
-│   └── classes/
-│       ├── settings.py         # validated configuration for one run
-│       ├── csv_writer.py       # streaming CSV sink
-│       └── checkpoint.py       # crash-resume bookkeeping
+│   ├── classes/
+│   │   ├── settings.py         # collector configuration
+│   │   ├── pipeline_settings.py # pipeline configuration
+│   │   ├── csv_writer.py       # streaming CSV sink
+│   │   └── checkpoint.py       # crash-resume bookkeeping
+│   └── pipeline/
+│       ├── load.py             # typed reading and deduplication
+│       ├── clean.py            # value ceiling, with quarantine
+│       ├── aggregate.py        # changes the grain to the weekly panel
+│       ├── features.py         # calendar, trend, and lags
+│       ├── split.py            # temporal split that never cuts a week
+│       ├── transform.py        # unfitted ColumnTransformer
+│       └── plots.py            # the four figures
+├── tests/
+├── data/
+│   ├── raw/                    # the witness: never edited
+│   ├── interim/                # cleaned items and quarantine
+│   └── processed/              # panel and panel with features
+├── reports/figures/            # the PNGs
 └── docs/
     ├── english/
     └── portuguese/
@@ -237,8 +363,16 @@ siasg-data-analysis/
 ## Requirements
 
 - Python 3.9 or later
-- `requests`, `pandas`, and `python-dotenv`
+- Collector: `requests`, `pandas`, and `python-dotenv`
+- Pipeline: `matplotlib`, `scikit-learn`, and `pyarrow`, on top of the above
+- Tests: `pytest`
 - No API key: the endpoint is public
+
+Everything at once, with pinned versions:
+
+```bash
+pip install -r requirements.txt
+```
 
 <a name="license-and-data-source"></a>
 

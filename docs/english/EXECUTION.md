@@ -155,7 +155,7 @@ sources: the network latency itself, and the backoff that reacts to a real
 
 | Key | Default | Description |
 |---|---|---|
-| `OUTPUT_CSV` | `data/contract_items.csv` | Path of the generated CSV |
+| `OUTPUT_CSV` | `data/raw/contract_items.csv` | Path of the generated CSV. It lives in `data/raw/` because that folder is the witness the pipeline consumes |
 | `CHECKPOINT_FILE` | `data/checkpoint.json` | Path of the progress file |
 | `RESUME` | `true` | `true` continues where it stopped; `false` deletes the CSV and starts over |
 | `TOP_ITEMS` | `20` | How many rows each summary ranking prints |
@@ -227,6 +227,96 @@ whole chunk, never the page: a chunk is recorded only after its last page has
 been written to disk. A crash mid-chunk costs only a re-download of that
 chunk, rather than risking a gap in the data.
 
+## 6. Prepare the data for analysis
+
+The collector produces the raw CSV. The preparation pipeline turns it into a
+weekly panel with features, ready for a model to consume.
+
+```bash
+python src/prepare.py
+```
+
+The stages run in order. Use `--ate` to stop at one of them:
+
+```bash
+python src/prepare.py --ate clean
+```
+
+The accepted values are `load`, `clean`, `aggregate`, `features`, and
+`plots`. The default runs everything.
+
+### What each stage writes
+
+| Stage | Artefact |
+|---|---|
+| `load` | nothing on disk; the frame stays in memory |
+| `clean` | `data/interim/itens_limpos.parquet` and `data/interim/quarentena.parquet` |
+| `aggregate` | `data/processed/painel.parquet` |
+| `features` | `data/processed/painel_features.parquet` |
+| `plots` | `reports/figures/*.png` |
+
+The files come out as Parquet. Without `pyarrow` installed, the pipeline warns
+and falls back to CSV, which takes more space and does not preserve types.
+
+### Pipeline configuration keys
+
+These keys live in the same `src/.env` as the collector and are read by
+`PipelineSettings`.
+
+#### Paths
+
+| Key | Default | Description |
+|---|---|---|
+| `DATA_DIR` | `data` | Root of the three layers. Changing this key redirects `raw/`, `interim/`, and `processed/` at once |
+| `RAW_CSV_NAME` | `contract_items.csv` | Name of the CSV inside `DATA_DIR/raw/` |
+| `FIGURES_DIR` | `reports/figures` | Where the PNGs are written |
+
+`data/raw/` is the witness: the pipeline never modifies it. Every derived
+artefact goes to `interim/` or `processed/`, so deleting both and running
+again rebuilds everything from the raw file.
+
+#### Reading and cleaning
+
+| Key | Default | Description |
+|---|---|---|
+| `STATUS_FILTER` | `Homologado` | Only items with this status go through |
+| `READ_CHUNK_ROWS` | `200000` | Rows per slice when reading the CSV. Lower reduces peak memory |
+| `VALUE_CEILING` | `10000000000` | Ceiling in R$ for one line item's awarded value |
+
+The R$ 10 billion ceiling was measured over a full year: it removes 6 items
+out of 1,440,492, and all three audited legitimate contracts survive. Raising
+it lets the six impossible rows back in; lowering it towards R$ 500 million
+starts taking the school meal programme.
+
+#### Panel
+
+| Key | Default | Description |
+|---|---|---|
+| `PANEL_FREQ` | `W` | Panel grain. `W` weekly, `M` monthly, `Q` quarterly, `D` daily |
+| `TOP_CLASSES` | `50` | How many largest classes by value keep their own name; the rest become `Outras` |
+
+`PANEL_FREQ` also sets the seasonal cycle and the name of the annual lag: with
+`M`, the column is called `valor_lag_12` instead of `valor_lag_52`.
+
+### What you will see
+
+```
+Estágios: load -> clean -> aggregate -> features -> plots
+Saída:    data/interim e data/processed
+Lendo data/raw/contract_items.csv
+582.385 linha(s) duplicada(s) removida(s) (17,7% do arquivo).
+1.276.695 linha(s) fora de 'Homologado' removida(s); 1.440.492 restantes.
+6 item(ns) em quarentena — valor total implausível para um item de linha —
+  somando R$ 393.976.620.419,96.
+Painel: 2.809 linhas (53 semanas x 53 combinações)
+4 figura(s) em reports/figures
+
+Pronto. 2.809 linhas no artefato final.
+```
+
+On the real 859 MB file, the whole run takes about 20 seconds and peaks at
+3.1 GB of memory.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -234,6 +324,10 @@ chunk, rather than risking a gap in the data.
 | `0` | Success, including the case where no item matches the filters |
 | `1` | Configuration error in `.env`, or API failure after the retries are spent |
 | `130` | Interrupted with `Ctrl+C`. The CSV was closed and remains consistent |
+
+The same three codes apply to `src/prepare.py`. There, `1` covers a
+configuration error and a missing raw CSV, and `0` includes the case where no
+row survives the filters.
 
 ## Troubleshooting
 
@@ -274,6 +368,42 @@ increase `REQUEST_DELAY`. Progress is saved: run again with `RESUME=true`.
 The file is written in `utf-8-sig`, which includes the BOM Excel needs to show
 accented text correctly. If the problem persists, check that Excel is
 configured to use the comma as the separator.
+
+### `data/raw/contract_items.csv não existe`
+
+The pipeline could not find the raw CSV. Run the collector first with
+`python src/main.py`, or point `DATA_DIR` and `RAW_CSV_NAME` at wherever the
+file actually is.
+
+### `O CSV bruto ficou ilegível a partir de algum ponto`
+
+The collector was interrupted inside a quoted field, and the truncation landed
+in the middle of the text. Wait for the collection to finish, or run the
+collector again with `RESUME=true` to complete the file.
+
+### `Aviso: o arquivo mudou durante a leitura`
+
+The collector was running while the pipeline read. No row was discarded
+because of it — the partial-row detection simply does not apply to that run.
+Run again once the collection finishes.
+
+### `AssertionError: limpeza perdeu linhas`
+
+One of the between-stage invariants failed: cleaning must split the frame into
+kept and quarantined, never shrink the total. This points at a defect in the
+cleaning code, not at misconfiguration. The same holds for
+`painel não é retângulo` and `a agregação não preservou a soma`.
+
+### `Aviso: valor_lag_52 está inteiramente vazia`
+
+Expected with the default 365-day window: the panel has 52 weekly steps, and a
+lag of 52 has no past to reach. Horizons of one to eight weeks are unaffected.
+To enable the annual horizon, widen `WINDOW_DAYS` and collect more history.
+
+### `Aviso: pyarrow não está instalado`
+
+The pipeline fell back to CSV instead of Parquet. It works, but the files are
+larger and types are not preserved. Install it with `pip install pyarrow`.
 
 ### `Aviso: não foi possível ler o checkpoint`
 

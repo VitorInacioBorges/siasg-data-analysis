@@ -120,12 +120,15 @@ new one that supersedes it and mark the old one as superseded.
 
 ### Organisation
 
-- `src/main.py` holds orchestration and nothing else.
+- `src/main.py` holds the collector's orchestration and nothing else.
+- `src/prepare.py` holds the pipeline's orchestration and nothing else.
 - `src/classes/` holds one class per file, each with a single responsibility.
+- `src/pipeline/` holds one stage per file, each testable on its own.
 - `src/read_type_methods.py` holds the typed `.env` readers.
 
-A new durable responsibility earns a file in `classes/`. A helper used only by
-`main.py` stays in `main.py`.
+A new durable responsibility earns a file in `classes/`. A new pipeline stage
+earns a file in `pipeline/`. A helper used by only one entry point stays in
+that entry point.
 
 ### Comments
 
@@ -152,13 +155,17 @@ Comments explain **why**, not **what**. The code already says what it does.
 Every new parameter follows the same path:
 
 1. Add the key to `src/.env.example`, with a comment explaining the default.
-2. Add the field to `Settings`, with a type annotation.
-3. Read the key in `Settings.from_env()` using the appropriate typed reader.
-4. Validate in `from_env()` anything the API would reject.
+2. Add the field to `Settings` (collector) or `PipelineSettings` (pipeline),
+   with a type annotation.
+3. Read the key in that class's `from_env()`, using the appropriate typed
+   reader.
+4. Validate in `from_env()` anything the API or the stage would reject.
 5. Document the key in the matching table in both `EXECUTION.md` and
    `EXECUCAO.md`.
 
-No module other than `Settings.from_env()` calls `os.getenv`.
+No module other than those two `from_env()` methods calls `os.getenv`. The two
+classes are separate on purpose: a pipeline run does not need the collector's
+validation to pass, and the other way round.
 
 ### Error handling
 
@@ -174,7 +181,7 @@ checkpoint.
 
 ### Durability
 
-Two invariants must not be broken:
+In the collector, two invariants must not be broken:
 
 1. A chunk is marked in the checkpoint only after all of its rows have been
    written and flushed to disk.
@@ -182,6 +189,32 @@ Two invariants must not be broken:
 
 Any change touching `collect()`, `CsvWriter`, or `Checkpoint` must preserve
 both.
+
+In the pipeline, three invariants are asserted in `prepare.py` between the
+stages, and must keep holding:
+
+1. Cleaning splits the frame, it never shrinks it:
+   `len(kept) + len(quarantined) == len(raw)`.
+2. The panel is a complete rectangle:
+   `len(panel) == weeks × combinations`.
+3. Aggregation preserves the sum of the values.
+
+They are `assert` statements, deliberately: a failure here is a code defect,
+not bad user input, and it must stop the run loudly.
+
+### Data handling
+
+Three rules apply to every pipeline stage:
+
+- **`data/raw/` is never edited.** It is the witness. Every derived artefact
+  goes to `interim/` or `processed/`, so deleting both and running again
+  rebuilds everything.
+- **Nothing is discarded in silence.** A removed row comes back in
+  `quarentena.parquet` with a `motivo` column.
+- **Nothing the model consumes may be pre-fitted.** Transformers come out
+  unfitted, for scikit-learn to refit inside each fold. A mean computed over
+  train and test together is leakage, and the symptom is a score that looks
+  too good.
 
 ## Git
 
