@@ -117,10 +117,43 @@ filtra por `STATUS_FILTER`. Devolve o grão de item.
 def limpar(df: pd.DataFrame, cfg: PipelineSettings) -> tuple[pd.DataFrame, pd.DataFrame]
 ```
 
+A limpeza tem **duas camadas**, e a segunda foi acrescentada depois de medir a
+primeira contra o ano inteiro.
+
+**Camada 1 — quantidade implausível dentro da classe:**
+
 ```
 z = (log10(quantidade) − mediana_da_classe) / (1.4826 × MAD_da_classe)
 suspeito se z > QTY_MAD_THRESHOLD
 ```
+
+**Camada 2 — valor total implausível para um item de linha:**
+
+```
+suspeito se valorTotalResultado > VALUE_CEILING     (padrão R$ 10 bi)
+```
+
+Por que a segunda existe: a camada 1, sozinha, **não pega a maior linha da
+base** — 1.713.940 unidades de serviço postal a R$ 132.000 cada, R$ 226
+bilhões, 31% do total. O z dela é 3,41, porque as linhas sem `codigoClasse`
+formam um grupo de 638.294 itens com quantidades de 1 a 29 bilhões, cujo MAD é
+uma ordem de magnitude inteira. Nenhum limiar de z separa esse caso: o que pega
+essa linha (3,0) remove também 49,57% do valor e 11.122 itens. Limitar o MAD por
+um teto dá o mesmo resultado, e um teto de quantidade não alcança 1,7 milhão de
+unidades sem levar 47,5% do valor junto.
+
+A absurdidade está no **produto**, não na quantidade: 1,7 milhão de unidades não
+chama atenção; 1,7 milhão de unidades a R$ 132.000 cada, sim. Medido no ano
+inteiro, o teto de R$ 10 bi remove **6 itens de 1.440.492** — 0,0004% — e os três
+contratos legítimos auditados (obras civis R$ 604 mi, ambulâncias R$ 824 mi,
+ressonância R$ 303 mi) sobrevivem a qualquer dos tetos testados. As doze maiores
+linhas são todas impossíveis, inclusive R$ 3,2 bilhões por unidade de perícia e
+R$ 10 bilhões por uma unidade de consultoria.
+
+As duas camadas se complementam: o teto pega o produto absurdo, e o z pega a
+quantidade absurda dentro de uma classe coerente — foi ele que pegou os
+11.880.000 tablets e os 6.264.000 notebooks, que o teto de R$ 10 bi não
+alcançaria.
 
 Três propriedades decidem se a regra funciona:
 

@@ -87,6 +87,11 @@ Ao fim dos dois arquivos (o `.env` usa CRLF — preserve):
 # DATA_DIR           raiz das três camadas de dados (raw, interim, processed).
 # RAW_CSV_NAME       nome do CSV que o coletor grava dentro de DATA_DIR/raw.
 # FIGURES_DIR        onde os gráficos PNG são gravados.
+# VALUE_CEILING      teto do valor de UM item de linha, em reais. Medido no ano
+#                    inteiro: R$ 10 bi remove 6 itens de 1.440.492 e preserva
+#                    os três contratos legítimos auditados. A regra de
+#                    quantidade por classe, sozinha, não pega a maior linha da
+#                    base (z = 3,41 contra limiar 8).
 # ===========================================================================
 PANEL_FREQ=W
 TOP_CLASSES=50
@@ -97,6 +102,7 @@ READ_CHUNK_ROWS=200000
 DATA_DIR=data
 RAW_CSV_NAME=contract_items.csv
 FIGURES_DIR=reports/figures
+VALUE_CEILING=10000000000
 ```
 
 - [ ] **Step 3: escrever o teste que falha**
@@ -239,6 +245,7 @@ class PipelineSettings:
     min_class_items: int = 30
     status_filter: str = "Homologado"
     read_chunk_rows: int = 200_000
+    value_ceiling: float = 10_000_000_000.0  # R$ per line item
 
     @classmethod
     def from_env(cls) -> "PipelineSettings":
@@ -260,6 +267,12 @@ class PipelineSettings:
             min_class_items=_read_int_min("MIN_CLASS_ITEMS", 30, 1),
             status_filter=_read_text("STATUS_FILTER", "Homologado"),
             read_chunk_rows=_read_int_min("READ_CHUNK_ROWS", 200_000, 1),
+            # Ceiling on one line item's awarded value. Measured on a full
+            # year: R$ 10 bi removes 6 items out of 1.440.492 and all three
+            # audited legitimate contracts survive. Raising it lets the six
+            # impossible rows back in; lowering it towards R$ 100 mi starts
+            # taking real public works.
+            value_ceiling=_read_float_min("VALUE_CEILING", 10_000_000_000.0, 1.0),
         )
 ```
 
@@ -739,7 +752,9 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
   Devolve `(kept, quarantined)`. A quarentena tem todas as colunas de entrada
   mais `motivo: str` e `z_quantidade: float`. Invariante:
   `len(kept) + len(quarantined) == len(df)`.
-  Também exporta `REASON_QUANTITY: str = "quantidade implausível na classe"`.
+  Também exporta `REASON_QUANTITY` e `REASON_VALUE`. A coluna `motivo` da
+  quarentena recebe um dos dois; quando as duas regras disparam na mesma
+  linha, o rótulo é o de valor.
 
 - [ ] **Step 1: escrever o teste que falha**
 
@@ -751,7 +766,7 @@ import pandas as pd
 import pytest
 
 from classes.pipeline_settings import PipelineSettings
-from pipeline.clean import REASON_QUANTITY, clean
+from pipeline.clean import REASON_QUANTITY, REASON_VALUE, clean
 
 
 @pytest.fixture
@@ -817,6 +832,69 @@ def test_rule_is_one_sided(cfg, base):
     assert "fracao" in set(kept["idCompraItem"])
 
 
+def test_quarantines_an_impossible_total(cfg, base):
+    """O teto de valor pega o que a regra de quantidade não alcança.
+
+    O caso real: 34 unidades de perícia a R$ 3,2 bilhões cada. A quantidade é
+    banal — 34 —, então o z não dispara. O produto é impossível.
+    """
+    absurdo = _frame([("pericia", "7010", "Serviço",
+                       34.0, 3_197_501_483.0, 108_715_050_420.0)])
+    kept, quarantined = clean(pd.concat([base, absurdo], ignore_index=True), cfg)
+    assert list(quarantined["idCompraItem"]) == ["pericia"]
+    assert quarantined["motivo"].iloc[0] == REASON_VALUE
+    assert "pericia" not in set(kept["idCompraItem"])
+
+
+def test_value_ceiling_spares_audited_legitimate_contracts(cfg, base):
+    """Os três contratos que auditamos à mão sobrevivem ao teto."""
+    legitimos = _frame([
+        ("obras", "sem-classe", "Serviço", 1.0, 616_720_624.99, 604_989_321.0),
+        ("ambulancia", "7010", "Material", 3000.0, 277_807.0, 824_931_000.0),
+        ("ressonancia", "7010", "Material", 50.0, 8_254_384.14, 303_286_600.0),
+    ])
+    kept, quarantined = clean(pd.concat([base, legitimos], ignore_index=True), cfg)
+    assert {"obras", "ambulancia", "ressonancia"} <= set(kept["idCompraItem"])
+    assert quarantined.empty
+
+
+def test_value_wins_the_label_when_both_rules_fire(cfg, base):
+    """Quantidade absurda E valor absurdo na mesma linha: o rótulo é de valor.
+
+    O total impossível é a afirmação mais forte — vale independentemente de como
+    a quantidade se compara à classe dela.
+    """
+    ambos = _frame([("tablet", "7010", "Material",
+                     11_880_000.0, 1550.0, 18_414_000_000.0)])
+    _, quarantined = clean(pd.concat([base, ambos], ignore_index=True), cfg)
+    assert quarantined["motivo"].iloc[0] == REASON_VALUE
+
+
+def test_missing_class_rows_form_their_own_group(cfg):
+    """O `dropna=False` do groupby tem de estar lá, e este teste prova.
+
+    Sem ele o pandas descarta o grupo nulo, a mediana e o MAD dessas linhas
+    viram NaN, elas caem no ramo `no_spread` e ficam isentas da regra. Isso
+    importa porque 44,3% dos dados reais não têm codigoClasse. Os fixtures dos
+    outros testes usam a string "sem-classe", que agrupa como qualquer texto e
+    não distingue as duas implementações.
+
+    O valor aqui fica abaixo do teto de propósito, para o resultado ser
+    atribuível só à camada de quantidade.
+    """
+    rng = np.random.default_rng(11)
+    nulos = [(f"n{i}", None, "Serviço", float(q), 1.0, float(q))
+             for i, q in enumerate(rng.integers(1, 500, 40))]
+    absurdo = [("bilhao", None, "Serviço", 1e9, 1.0, 1e9)]
+    entry = _frame(nulos + absurdo)
+
+    kept, quarantined = clean(entry, cfg)
+
+    assert list(quarantined["idCompraItem"]) == ["bilhao"]
+    assert quarantined["motivo"].iloc[0] == REASON_QUANTITY
+    assert "bilhao" not in set(kept["idCompraItem"])
+
+
 def test_nothing_evaporates(cfg, base):
     suspect = _frame([("tablet", "7010", "Material",
                         11_880_000.0, 1550.0, 18_414_000_000.0)])
@@ -869,8 +947,12 @@ import numpy as np
 import pandas as pd
 
 from classes.pipeline_settings import PipelineSettings
+# Reused rather than duplicated: the messages here are Portuguese too, and one
+# number formatter for the package is one place to fix it.
+from pipeline.load import _pt_br
 
 REASON_QUANTITY = "quantidade implausível na classe"
+REASON_VALUE = "valor total implausível para um item de linha"
 
 # Scale factor that makes the median absolute deviation a consistent estimator
 # of the standard deviation for normally distributed data. Without it the
@@ -922,22 +1004,47 @@ def clean(df: pd.DataFrame, cfg: PipelineSettings) -> tuple[pd.DataFrame, pd.Dat
     # cannot produce the R$ 226 billion artefact; and quantity 1 is the norm for
     # works and continuing services. Only the high tail is suspect.
     # NaN comparisons are False, so rows without a usable quantity are kept.
-    suspect = (z > cfg.qty_mad_threshold) & ~no_spread
+    suspect_quantity = (z > cfg.qty_mad_threshold) & ~no_spread
     if global_mad == 0:
         # Degenerate input: every quantity in the frame is identical.
-        suspect = pd.Series(False, index=work.index)
+        suspect_quantity = pd.Series(False, index=work.index)
+
+    # Second layer, and the one that catches the dominant errors. Measured
+    # against a full year: the quantity rule alone misses the largest row in
+    # the dataset — 1.713.940 units of postal service at R$ 132.000 each,
+    # R$ 226 bilhoes, 31% of the total. Its z is 3,41, because the rows with no
+    # class form a group of 638.294 items spanning quantities from 1 to 29
+    # bilhoes, whose MAD is a full order of magnitude. No z threshold separates
+    # that row: the one that catches it (3,0) also removes 49,57% of the value.
+    #
+    # The absurdity is in the PRODUCT, not the quantity. 1,7 million units is
+    # unremarkable; 1,7 million units at R$ 132.000 each is not. So the second
+    # rule reads the awarded total, and it is the cheapest cut in the pipeline:
+    # 6 items out of 1.440.492, with every audited legitimate contract intact.
+    suspect_value = work["valorTotalResultado"] > cfg.value_ceiling
+
+    suspect = suspect_quantity | suspect_value
+
+    # The value rule wins the label when both fire, because it is the stronger
+    # statement: a total this large is impossible regardless of how the
+    # quantity compares to its class.
+    reason = pd.Series(pd.NA, index=work.index, dtype="string")
+    reason[suspect_quantity] = REASON_QUANTITY
+    reason[suspect_value] = REASON_VALUE
 
     quarantined = work[suspect].copy()
-    quarantined["motivo"] = REASON_QUANTITY
+    quarantined["motivo"] = reason[suspect]
     quarantined["z_quantidade"] = z[suspect]
 
     kept = work[~suspect].drop(columns="_log_qtd")
     quarantined = quarantined.drop(columns="_log_qtd")
 
-    if len(quarantined):
-        value = quarantined["valorTotalResultado"].sum()
-        print(f"{len(quarantined):,} item(ns) em quarentena por quantidade "
-              f"implausível, somando R$ {value:,.2f}.")
+    for label, mask in ((REASON_VALUE, suspect_value),
+                        (REASON_QUANTITY, suspect_quantity & ~suspect_value)):
+        if mask.any():
+            total = work.loc[mask, "valorTotalResultado"].sum()
+            print(f"{_pt_br(int(mask.sum()))} item(ns) em quarentena — {label} — "
+                  f"somando R$ {_pt_br(total, 2)}.")
 
     return kept.reset_index(drop=True), quarantined.reset_index(drop=True)
 ```
