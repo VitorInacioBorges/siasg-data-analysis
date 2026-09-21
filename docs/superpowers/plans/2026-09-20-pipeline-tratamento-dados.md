@@ -117,8 +117,6 @@ python_files = test_*.py
 `tests/test_pipeline_settings.py`:
 
 ```python
-import os
-
 from classes.pipeline_settings import PipelineSettings
 from read_type_methods import ConfigError
 
@@ -242,7 +240,7 @@ class PipelineSettings:
 - [ ] **Step 6: rodar e confirmar que passa**
 
 Run: `venv/bin/python -m pytest tests/test_pipeline_settings.py -v`
-Expected: 3 passed
+Expected: 4 passed
 
 - [ ] **Step 7: commit**
 
