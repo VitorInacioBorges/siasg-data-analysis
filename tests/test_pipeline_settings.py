@@ -3,15 +3,14 @@ from read_type_methods import ConfigError
 
 
 def test_reads_the_defaults(monkeypatch):
-    for key in ("PANEL_FREQ", "TOP_CLASSES", "QTY_MAD_THRESHOLD",
-                  "MIN_CLASS_ITEMS", "STATUS_FILTER", "READ_CHUNK_ROWS"):
+    for key in ("PANEL_FREQ", "TOP_CLASSES", "STATUS_FILTER",
+                  "READ_CHUNK_ROWS", "VALUE_CEILING"):
         monkeypatch.delenv(key, raising=False)
     cfg = PipelineSettings.from_env()
     assert cfg.panel_freq == "W"
     assert cfg.top_classes == 50
-    assert cfg.qty_mad_threshold == 8.0
-    assert cfg.min_class_items == 30
     assert cfg.status_filter == "Homologado"
+    assert cfg.value_ceiling == 10_000_000_000.0
 
 
 def test_paths_derive_from_the_data_root(monkeypatch):

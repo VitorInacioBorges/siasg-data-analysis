@@ -40,10 +40,9 @@ class PipelineSettings:
     figures_dir: Path
     panel_freq: str = "W"
     top_classes: int = 50
-    qty_mad_threshold: float = 8.0
-    min_class_items: int = 30
     status_filter: str = "Homologado"
     read_chunk_rows: int = 200_000
+    value_ceiling: float = 10_000_000_000.0  # R$ per line item
 
     @classmethod
     def from_env(cls) -> "PipelineSettings":
@@ -61,8 +60,12 @@ class PipelineSettings:
             # zero classes leaves nothing to group by, a zero threshold flags
             # every row, and a zero chunk makes pandas raise.
             top_classes=_read_int_min("TOP_CLASSES", 50, 1),
-            qty_mad_threshold=_read_float_min("QTY_MAD_THRESHOLD", 8.0, 0.1),
-            min_class_items=_read_int_min("MIN_CLASS_ITEMS", 30, 1),
             status_filter=_read_text("STATUS_FILTER", "Homologado"),
             read_chunk_rows=_read_int_min("READ_CHUNK_ROWS", 200_000, 1),
+            # Ceiling on one line item's awarded value. Measured on a full
+            # year: R$ 10 bi removes 6 items out of 1.440.492 and all three
+            # audited legitimate contracts survive. Raising it lets the six
+            # impossible rows back in; lowering it towards R$ 500 mi starts
+            # taking the school meal programme.
+            value_ceiling=_read_float_min("VALUE_CEILING", 10_000_000_000.0, 1.0),
         )
