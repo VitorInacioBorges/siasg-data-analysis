@@ -424,6 +424,35 @@ def test_drops_a_partial_last_row(tmp_path, capsys):
     assert "pela metade" in capsys.readouterr().out
 
 
+def test_file_changing_mid_read_discards_nothing(tmp_path, capsys, monkeypatch):
+    """Se o arquivo muda durante a leitura, nenhuma linha é descartada.
+
+    O motivo de existir: a foto de "termina no meio de uma linha" é tirada
+    antes do parse. Se o coletor completa a escrita nesse intervalo, o sinal
+    fica velho e o descarte joga fora uma linha legítima. Checar depois do
+    parse não resolve — só move a janela para o erro simétrico.
+    """
+    from pipeline import load as modulo
+
+    path = tmp_path / "contract_items.csv"
+    # A linha parcial é cortada DEPOIS da coluna de situação, senão o filtro de
+    # status a removeria por conta própria e o teste não provaria nada.
+    parcial = ("e2,2025-09-22T00:04:59,7010,Material,Homologado,"
+               "Informática (TIC),True,,10,100.0")
+    path.write_text(HEADER + _row("e1") + parcial, encoding="utf-8-sig")
+
+    fotos = iter([(1, 1), (2, 2)])          # duas fotos diferentes = mudou
+    monkeypatch.setattr(modulo, "_snapshot", lambda _: next(fotos))
+
+    df = load_raw(path, _cfg_for(path))
+
+    out = capsys.readouterr().out
+    assert "mudou durante a leitura" in out
+    assert "nenhuma linha foi descartada" in out
+    # a parcial continua ali: o sinal que mandaria descartá-la era velho
+    assert set(df["idCompraItem"]) == {"e1", "e2"}
+
+
 def test_truncation_inside_a_quoted_field_gives_a_clear_error(tmp_path):
     """on_bad_lines não pega este caso: o pandas levanta ParserError.
 
@@ -522,6 +551,16 @@ def _pt_br(number: float, decimals: int = 0) -> str:
     return texto.replace(",", "\x00").replace(".", ",").replace("\x00", ".")
 
 
+def _snapshot(path: Path) -> tuple[int, int]:
+    """Size and mtime — the pair that says whether the file moved.
+
+    Its own function so a test can replace it deterministically, instead of
+    patching Path.stat and catching every incidental call.
+    """
+    info = path.stat()
+    return info.st_size, info.st_mtime_ns
+
+
 def _ends_mid_row(path: Path) -> bool:
     """True when the file does not end in a newline — its last row is partial.
 
@@ -569,7 +608,7 @@ def load_raw(path: Path, cfg: PipelineSettings) -> pd.DataFrame:
     # appending mid-read is exactly the case this module claims to tolerate.
     # Without this guard, rows appended between the passes would be reported as
     # malformed: a false alarm in the one scenario the warning exists for.
-    before_stat = path.stat()
+    before = _snapshot(path)
     in_file = _count_lines(path) - 1  # minus the header
     partial_tail = _ends_mid_row(path)
 
@@ -598,25 +637,36 @@ def load_raw(path: Path, cfg: PipelineSettings) -> pd.DataFrame:
         ) from None
     df = pd.concat(frames, ignore_index=True)
 
-    # The partial last row is dropped before anything counts it. It has to go
-    # first: it is NaN-padded, so it would survive dedup (its id is intact),
-    # contribute zero to every sum, and quietly understate the panel.
-    if partial_tail and len(df):
-        df = df.iloc[:-1]
-        print("Aviso: a última linha do CSV estava pela metade e foi descartada "
-              "(o coletor está rodando?).")
+    # Whether the file moved is decided BEFORE anything acts on the earlier
+    # measurements, because all of them came from separate reads. Acting first
+    # and disclaiming afterwards is what the previous version did, and it
+    # discarded a legitimate row whenever the collector finished its write
+    # during the parse: the drop had already happened by the time the warning
+    # printed.
+    changed = _snapshot(path) != before
 
-    read_rows = len(df)
-    after_stat = path.stat()
-    changed = ((before_stat.st_size, before_stat.st_mtime_ns)
-               != (after_stat.st_size, after_stat.st_mtime_ns))
     if changed:
+        # No check before or after the parse is exact on a file being appended
+        # to — a post-parse check only moves the window, it does not close it.
+        # Two orderings, two opposite wrong answers, and nothing distinguishes
+        # them from here. So the honest move is to act on none of it.
         print("Aviso: o arquivo mudou durante a leitura — o coletor está rodando? "
-              "A contagem de linhas puladas não é confiável nesta execução.")
-    elif in_file > read_rows:
-        print(f"Aviso: {_pt_br(in_file - read_rows)} linha(s) do CSV foram puladas "
-              f"por estarem malformadas (provavelmente a última, se o coletor "
-              f"estava rodando).")
+              "Nem a contagem de linhas puladas nem a detecção de linha parcial "
+              "valem para esta execução, e nenhuma linha foi descartada por "
+              "isso. Rode de novo quando a coleta terminar.")
+    else:
+        # Nothing moved, so both measurements describe the bytes pandas parsed.
+        # The partial row goes before anything counts it: NaN-padded and with
+        # its id intact, it would survive dedup, add zero to every sum, and
+        # quietly understate the panel.
+        if partial_tail and len(df):
+            df = df.iloc[:-1]
+            print("Aviso: a última linha do CSV estava pela metade e foi "
+                  "descartada (o coletor foi interrompido?).")
+        skipped = in_file - len(df)
+        if skipped > 0:
+            print(f"Aviso: {_pt_br(skipped)} linha(s) do CSV foram puladas por "
+                  f"estarem malformadas.")
 
     df = df.drop(columns=[c for c in DEAD_COLUMNS if c in df.columns])
 
