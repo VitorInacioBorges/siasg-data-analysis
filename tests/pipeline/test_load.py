@@ -76,11 +76,16 @@ def _cfg_for(path):
 
 
 def test_reports_skipped_lines(tmp_path, capsys):
-    """Uma linha com campo SOBRANDO é pulada pelo pandas — e o aviso conta.
+    """Uma linha com campo SOBRANDO é descartada — e o pandas diz qual.
 
-    Medido no pandas 3.0.5: on_bad_lines="skip" descarta a linha que tem campos
-    a mais, e só essa. Campo faltando é preenchido com NaN e mantido — por isso
-    truncamento tem detecção própria, nos dois testes seguintes.
+    Medido no pandas 3.0.5: `on_bad_lines` descarta a linha com campos a mais,
+    e só essa. Campo faltando é preenchido com NaN e mantido, por isso
+    truncamento tem detecção própria nos dois testes seguintes.
+
+    A mensagem vem do pandas, não de uma contagem nossa: contar por bytes
+    errava nesta base, porque `descricaoResumida` tem newline dentro de campo
+    citado — 218.100 deles — e todo run anunciava 218.100 linhas puladas sem
+    que nada tivesse sido pulado.
     """
     path = tmp_path / "contract_items.csv"
     path.write_text(
@@ -94,8 +99,31 @@ def test_reports_skipped_lines(tmp_path, capsys):
 
     assert set(df["idCompraItem"]) == {"b1", "b3"}
     out = capsys.readouterr().out
-    assert "puladas" in out
-    assert "1 linha" in out
+    assert "leitor de CSV" in out
+    assert "Skipping line" in out
+
+
+def test_embedded_newlines_do_not_raise_a_false_alarm(tmp_path, capsys):
+    """Newline dentro de campo citado não é linha pulada.
+
+    A regressão que este teste guarda: uma contagem por bytes veria três
+    newlines onde o CSV tem duas linhas, e acusaria uma linha inexistente de
+    malformada.
+    """
+    path = tmp_path / "contract_items.csv"
+    campo_com_quebra = '"Notebook\ncom descrição em duas linhas"'
+    linha = (f"c2,2025-09-22T00:04:59,7010,Material,Homologado,"
+             f"Informática (TIC),True,,10,100.0,1000.0,900.0\n")
+    path.write_text(
+        HEADER
+        + linha.replace("Informática (TIC)", campo_com_quebra)
+        + _row("c1"),
+        encoding="utf-8-sig")
+
+    df = load_raw(path, _cfg_for(path))
+
+    assert len(df) == 2
+    assert "leitor de CSV" not in capsys.readouterr().out
 
 
 def test_drops_a_partial_last_row(tmp_path, capsys):
@@ -166,7 +194,7 @@ def test_truncation_inside_a_quoted_field_gives_a_clear_error(tmp_path):
 def test_no_message_when_nothing_is_skipped(cfg, capsys):
     """O caminho silencioso também precisa ser afirmado, não só acontecer."""
     load_raw(cfg.raw_csv, cfg)
-    assert "puladas" not in capsys.readouterr().out
+    assert "leitor de CSV" not in capsys.readouterr().out
 
 
 def test_missing_file_gives_a_clear_message(cfg, tmp_path):

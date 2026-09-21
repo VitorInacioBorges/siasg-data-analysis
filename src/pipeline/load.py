@@ -24,6 +24,7 @@ function is one full frame in memory.
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import pandas as pd
@@ -92,18 +93,6 @@ def _ends_mid_row(path: Path) -> bool:
         return handle.read(1) != b"\n"
 
 
-def _count_lines(path: Path) -> int:
-    """Counts newlines in 8 MiB blocks — four times faster than iterating lines.
-
-    Measured on the real 859 MB file: 0,39s by blocks against 1,51s by lines.
-    """
-    total = 0
-    with path.open("rb") as handle:
-        while (block := handle.read(8 << 20)):
-            total += block.count(b"\n")
-    return total
-
-
 def load_raw(path: Path, cfg: PipelineSettings) -> pd.DataFrame:
     """Reads the raw CSV, deduplicates it, and returns the item grain."""
     if not path.exists():
@@ -118,22 +107,25 @@ def load_raw(path: Path, cfg: PipelineSettings) -> pd.DataFrame:
     # Without this guard, rows appended between the passes would be reported as
     # malformed: a false alarm in the one scenario the warning exists for.
     before = _snapshot(path)
-    in_file = _count_lines(path) - 1  # minus the header
     partial_tail = _ends_mid_row(path)
 
     slices = pd.read_csv(
         path,
         encoding="utf-8-sig",
         chunksize=cfg.read_chunk_rows,
-        # Catches rows with EXTRA fields. Rows with missing fields are
-        # NaN-padded instead, which is why _ends_mid_row exists.
-        on_bad_lines="skip",
+        # "warn" rather than "skip": both discard a row with EXTRA fields,
+        # but "warn" makes pandas say so, in its own words, instead of leaving
+        # us to infer it. Rows with MISSING fields are NaN-padded either way,
+        # which is why _ends_mid_row exists.
+        on_bad_lines="warn",
         parse_dates=["dataInclusaoPncp"],
         dtype={c: "string" for c in TEXT_COLUMNS},
         low_memory=False,
     )
     try:
-        frames = list(slices)
+        with warnings.catch_warnings(record=True) as parser_warnings:
+            warnings.simplefilter("always", pd.errors.ParserWarning)
+            frames = list(slices)
     except pd.errors.ParserError as error:
         # Truncation landing inside a quoted field raises instead of skipping,
         # and on_bad_lines does not catch it. A clear message beats a traceback
@@ -159,23 +151,38 @@ def load_raw(path: Path, cfg: PipelineSettings) -> pd.DataFrame:
         # to — a post-parse check only moves the window, it does not close it.
         # Two orderings, two opposite wrong answers, and nothing distinguishes
         # them from here. So the honest move is to act on none of it.
+        #
+        # This does not disclaim the CSV-reader warnings printed below: those
+        # come from pandas itself, live during the parse, and hold regardless
+        # of what the file does afterwards — only the partial-row heuristic
+        # depends on a stale pre-parse snapshot.
         print("Aviso: o arquivo mudou durante a leitura — o coletor está rodando? "
-              "Nem a contagem de linhas puladas nem a detecção de linha parcial "
-              "valem para esta execução, e nenhuma linha foi descartada por "
-              "isso. Rode de novo quando a coleta terminar.")
+              "A detecção de linha parcial não vale para esta execução, e "
+              "nenhuma linha foi descartada por isso. Rode de novo quando a "
+              "coleta terminar.")
     else:
-        # Nothing moved, so both measurements describe the bytes pandas parsed.
-        # The partial row goes before anything counts it: NaN-padded and with
-        # its id intact, it would survive dedup, add zero to every sum, and
-        # quietly understate the panel.
+        # Nothing moved, so the pre-read check describes the bytes pandas
+        # parsed. The partial row goes first: NaN-padded and with its id
+        # intact, it would survive dedup, add zero to every sum, and quietly
+        # understate the panel.
         if partial_tail and len(df):
             df = df.iloc[:-1]
             print("Aviso: a última linha do CSV estava pela metade e foi "
                   "descartada (o coletor foi interrompido?).")
-        skipped = in_file - len(df)
-        if skipped > 0:
-            print(f"Aviso: {_pt_br(skipped)} linha(s) do CSV foram puladas por "
-                  f"estarem malformadas.")
+
+    # Reported whether or not the file moved: these are pandas' own words about
+    # rows it discarded, and they are true regardless.
+    #
+    # This replaces an earlier count of our own, which subtracted the rows
+    # pandas returned from the newlines in the file. That arithmetic was wrong
+    # on this data: `descricaoResumida` contains newlines inside quoted fields —
+    # 218.100 of them, measured — so the byte count exceeded the row count by
+    # exactly that much and every run announced "218.100 linhas puladas" when
+    # nothing had been skipped at all. Counting correctly means tracking quote
+    # parity across 859 MB, which measured 7,85s against 0,39s for the naive
+    # version. Asking pandas is exact and free.
+    for warning in parser_warnings:
+        print(f"Aviso do leitor de CSV: {str(warning.message)[:300]}")
 
     df = df.drop(columns=[c for c in DEAD_COLUMNS if c in df.columns])
 
