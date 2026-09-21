@@ -374,30 +374,69 @@ def test_types_and_normalisation(cfg):
     assert df["codigoClasse"].iloc[0] == "7010"
 
 
-def test_reports_skipped_lines(tmp_path, capsys):
-    """Uma linha malformada é pulada — e o aviso tem de dizer quantas.
+def _cfg_for(path):
+    return PipelineSettings(
+        raw_csv=path, interim_dir=path.parent / "i",
+        processed_dir=path.parent / "p", figures_dir=path.parent / "f")
 
-    O CSV pode estar sendo escrito pelo coletor, então a última linha vem pela
-    metade. Pular é certo; pular em silêncio é perda de dado sem rastro.
+
+def test_reports_skipped_lines(tmp_path, capsys):
+    """Uma linha com campo SOBRANDO é pulada pelo pandas — e o aviso conta.
+
+    Medido no pandas 3.0.5: on_bad_lines="skip" descarta a linha que tem campos
+    a mais, e só essa. Campo faltando é preenchido com NaN e mantido — por isso
+    truncamento tem detecção própria, nos dois testes seguintes.
     """
-    path = tmp_path / "raw" / "contract_items.csv"
-    path.parent.mkdir(parents=True)
+    path = tmp_path / "contract_items.csv"
     path.write_text(
         HEADER
         + _row("b1")
-        + "b2,2025-09-22T00:04:59,7010,Material,Homologado\n"   # colunas faltando
+        + _row("b2").rstrip("\n") + ",campo,a,mais\n"   # campos sobrando
         + _row("b3"),
         encoding="utf-8-sig")
-    cfg = PipelineSettings(
-        raw_csv=path, interim_dir=tmp_path / "i",
-        processed_dir=tmp_path / "p", figures_dir=tmp_path / "f")
 
-    df = load_raw(path, cfg)
+    df = load_raw(path, _cfg_for(path))
 
     assert set(df["idCompraItem"]) == {"b1", "b3"}
-    saida = capsys.readouterr().out
-    assert "puladas" in saida
-    assert "1 linha" in saida
+    out = capsys.readouterr().out
+    assert "puladas" in out
+    assert "1 linha" in out
+
+
+def test_drops_a_partial_last_row(tmp_path, capsys):
+    """A linha pela metade é descartada, não apenas contada.
+
+    É a forma que o coletor produz ao ser morto no meio de uma gravação: sem
+    newline final, campos faltando. O pandas a preencheria com NaN e a
+    manteria; com o id intacto ela sobreviveria à deduplicação, somaria zero em
+    tudo e subestimaria o painel em silêncio.
+    """
+    path = tmp_path / "contract_items.csv"
+    path.write_text(
+        HEADER
+        + _row("c1")
+        + "c2,2025-09-22T00:04:59,7010,Mat",   # cortada no meio, sem newline
+        encoding="utf-8-sig")
+
+    df = load_raw(path, _cfg_for(path))
+
+    assert set(df["idCompraItem"]) == {"c1"}
+    assert "pela metade" in capsys.readouterr().out
+
+
+def test_truncation_inside_a_quoted_field_gives_a_clear_error(tmp_path):
+    """on_bad_lines não pega este caso: o pandas levanta ParserError.
+
+    Sem tratamento, load_raw morre com um traceback do tokenizador que não diz
+    nada a quem roda. A mensagem tem de nomear a causa e o que fazer.
+    """
+    path = tmp_path / "contract_items.csv"
+    path.write_text(
+        HEADER + _row("d1") + 'd2,2025-09-22T00:04:59,"classe sem fecho',
+        encoding="utf-8-sig")
+
+    with pytest.raises(RuntimeError, match="RESUME=true"):
+        load_raw(path, _cfg_for(path))
 
 
 def test_no_message_when_nothing_is_skipped(cfg, capsys):
@@ -431,6 +470,12 @@ clean.py — this module's job is to hand the next stage a typed, honest frame.
 The raw CSV is several hundred megabytes — 859 MB and 3,5 million rows as
 measured — and may be mid-write while the collector runs, so the read tolerates
 a truncated last line.
+
+What "tolerant" means precisely, because the obvious reading is wrong: pandas
+skips a row with extra fields, NaN-pads a row with missing fields, and raises
+outright if a truncation lands inside a quoted field. Only the first of those
+is `on_bad_lines`. So the module checks for a partial last row itself, drops it,
+and turns the parser error into a message that names the cause.
 
 A note on `chunksize`, so nobody reads more into it than is there: the frame is
 concatenated immediately, because deduplicating needs a whole-file view and
@@ -477,6 +522,28 @@ def _pt_br(number: float, decimals: int = 0) -> str:
     return texto.replace(",", "\x00").replace(".", ",").replace("\x00", ".")
 
 
+def _ends_mid_row(path: Path) -> bool:
+    """True when the file does not end in a newline — its last row is partial.
+
+    This is the only reliable signal that the collector was cut off mid-write,
+    and it matters because pandas cannot tell. Measured against pandas 3.0.5:
+    `on_bad_lines="skip"` discards a row with EXTRA fields, but a row with
+    MISSING fields — which is what a truncated line is — gets NaN-padded and
+    kept. The newline count cannot see it either, since an unterminated line
+    contributes no newline byte, so the skipped-line comparison stays silent
+    and the half row reaches the panel.
+
+    CsvWriter writes through the csv module, which always emits a line
+    terminator, so for this pipeline's own raw file a missing final newline
+    means truncation and nothing else.
+    """
+    with path.open("rb") as handle:
+        if handle.seek(0, 2) == 0:
+            return False          # empty file: nothing to be partial
+        handle.seek(-1, 2)
+        return handle.read(1) != b"\n"
+
+
 def _count_lines(path: Path) -> int:
     """Counts newlines in 8 MiB blocks — four times faster than iterating lines.
 
@@ -504,20 +571,40 @@ def load_raw(path: Path, cfg: PipelineSettings) -> pd.DataFrame:
     # malformed: a false alarm in the one scenario the warning exists for.
     before_stat = path.stat()
     in_file = _count_lines(path) - 1  # minus the header
+    partial_tail = _ends_mid_row(path)
 
     slices = pd.read_csv(
         path,
         encoding="utf-8-sig",
         chunksize=cfg.read_chunk_rows,
-        # The collector may be appending right now, leaving the last line half
-        # written. Skipping it is right; doing so silently is not — the count
-        # is reported below.
+        # Catches rows with EXTRA fields. Rows with missing fields are
+        # NaN-padded instead, which is why _ends_mid_row exists.
         on_bad_lines="skip",
         parse_dates=["dataInclusaoPncp"],
         dtype={c: "string" for c in TEXT_COLUMNS},
         low_memory=False,
     )
-    df = pd.concat(list(slices), ignore_index=True)
+    try:
+        frames = list(slices)
+    except pd.errors.ParserError as error:
+        # Truncation landing inside a quoted field raises instead of skipping,
+        # and on_bad_lines does not catch it. A clear message beats a traceback
+        # the reader has to decode.
+        raise RuntimeError(
+            f"O CSV bruto ficou ilegível a partir de algum ponto ({error}). "
+            f"Isso acontece quando o coletor é interrompido no meio de um campo "
+            f"entre aspas. Espere o coletor terminar, ou rode-o de novo com "
+            f"RESUME=true para completar o arquivo."
+        ) from None
+    df = pd.concat(frames, ignore_index=True)
+
+    # The partial last row is dropped before anything counts it. It has to go
+    # first: it is NaN-padded, so it would survive dedup (its id is intact),
+    # contribute zero to every sum, and quietly understate the panel.
+    if partial_tail and len(df):
+        df = df.iloc[:-1]
+        print("Aviso: a última linha do CSV estava pela metade e foi descartada "
+              "(o coletor está rodando?).")
 
     read_rows = len(df)
     after_stat = path.stat()
