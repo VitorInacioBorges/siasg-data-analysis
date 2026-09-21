@@ -48,6 +48,17 @@ Como os títulos se repetem nas duas metades, as âncoras geradas colidem. Dê �
 metade em inglês âncoras explícitas com `<a name="...">` onde algum link
 precisar alcançá-la, e coloque um seletor de idioma no topo de cada metade.
 
+### Material de skill e de plugin fica em um só idioma
+
+Tudo que é produzido por ou para uma skill ou um plugin está isento da regra
+bilíngue. Isso cobre `docs/superpowers/` — os specs de design e os planos de
+implementação escritos pelas skills de brainstorming e de planejamento — e
+qualquer outro diretório que pertença a uma ferramenta.
+
+São artefatos de trabalho de um fluxo, não documentação que o projeto publica.
+Ficam no idioma em que o trabalho acontece, que neste projeto é o português, e
+nunca são espelhados.
+
 ### Nomes de arquivo
 
 Use apenas caracteres ASCII. `EXECUCAO.md`, nunca `EXECUÇÃO.md`: acentos em

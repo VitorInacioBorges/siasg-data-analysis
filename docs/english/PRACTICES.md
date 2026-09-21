@@ -48,6 +48,17 @@ Because the headings repeat across the two halves, their anchor slugs collide.
 Give the English half explicit `<a name="...">` anchors wherever a link has to
 reach it, and put a language switcher at the top of each half.
 
+### Skill and plugin material stays in one language
+
+Anything produced by or for a skill or a plugin is exempt from the bilingual
+rule. That covers `docs/superpowers/` — the design specs and implementation
+plans written by the brainstorming and planning skills — and any other
+directory a tool owns.
+
+These are working artifacts of a workflow, not documentation the project
+publishes. They are written in the language the work happens in, which for this
+project is Portuguese, and they are never mirrored.
+
 ### Filenames
 
 Use ASCII characters only. `EXECUCAO.md`, never `EXECUÇÃO.md`: accents in

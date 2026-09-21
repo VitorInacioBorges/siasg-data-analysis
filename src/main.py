@@ -31,6 +31,7 @@ raised deep in fetch_page() and still be reported cleanly in main().
 # `dict[str, Any]` work on Python versions before 3.9/3.10.
 from __future__ import annotations
 
+import random
 import threading
 import time
 
@@ -58,6 +59,14 @@ load_dotenv() # .env file loading
 # window slides by a day on every run, every boundary moves with it, and one
 # run's checkpoint is worthless to the next.
 CHUNK_EPOCH = date(2000, 1, 3)
+
+# Ceiling for a Retry-After the API sends us, in seconds. The header is a
+# suggestion to respect, not a reason to park the run indefinitely.
+MAX_RETRY_AFTER = 60.0
+
+# Random extra wait added to every retry, in seconds, so threads throttled at
+# the same instant do not all wake on the same second and collide again.
+RETRY_JITTER = 0.5
 
 def align_to_grid(day: date, chunk_days: int) -> date:
     """Moves `day` back to the previous boundary of the global grid."""
@@ -88,6 +97,10 @@ def fetch_page(session: requests.Session, settings: Settings, params: dict[str, 
     # Attempts are numbered from 1 because the number is both displayed to the
     # user and used as the backoff multiplier below.
     for attempt in range(1, settings.max_retries + 1):
+        # How long the API asked us to wait, when it bothers to say. Reset per
+        # attempt so a stale value from an earlier one cannot leak forward.
+        retry_after = None
+
         try:
             response = session.get(
                 settings.items_url, params=params, timeout=settings.request_timeout
@@ -127,6 +140,22 @@ def fetch_page(session: requests.Session, settings: Settings, params: dict[str, 
             # Left over: 408, 429 and every 5xx — all worth retrying.
             else:
                 last_problem = f"status {response.status_code}"
+                # This API answers a 429 with `Retry-After: 1` — it is telling
+                # us the wait it actually wants, and it is a second, not the
+                # fifteen the linear backoff below would spend. Honouring the
+                # header is the difference between a throttled page costing 1s
+                # and costing 15s, which over thousands of pages is the
+                # difference between a two-hour run and an overnight one.
+                announced = response.headers.get("Retry-After")
+                if announced:
+                    try:
+                        # Capped: the header is the server's suggestion, not a
+                        # licence to park the run for an hour.
+                        retry_after = min(float(announced), MAX_RETRY_AFTER)
+                    except ValueError:
+                        # Retry-After may also be an HTTP date, which we do not
+                        # parse; fall through to the linear backoff.
+                        retry_after = None
 
         # Budget exhausted. Raising RuntimeError (rather than exiting) lets
         # collect() run its finally block and main() print the resume hint.
@@ -136,9 +165,13 @@ def fetch_page(session: requests.Session, settings: Settings, params: dict[str, 
                 f"Tente aumentar RETRY_BACKOFF ou reduzir PAGE_SIZE no .env."
             )
 
-        # Linear backoff: 15s, 30s, 45s… Each wait is longer than the last, so
-        # a throttled API is given progressively more room to recover.
-        wait = settings.retry_backoff * attempt
+        # The server's own number when it gave one; otherwise linear backoff
+        # — 15s, 30s, 45s… — so an API that stays silent gets progressively
+        # more room to recover.
+        wait = retry_after if retry_after is not None else settings.retry_backoff * attempt
+        # Jitter: several worker threads throttled at the same moment would
+        # otherwise wake together and collide again on the same second.
+        wait += random.uniform(0, RETRY_JITTER)
         print(f"    {last_problem}; aguardando {wait}s antes de tentar de novo "
               f"(tentativa {attempt}/{settings.max_retries})...")
         time.sleep(wait)
