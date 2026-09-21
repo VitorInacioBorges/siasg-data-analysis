@@ -14,7 +14,7 @@ média de um `StandardScaler` calculada com dados de teste é vazamento.
 **Tech Stack:** Python 3.14, pandas 3.0.5, scikit-learn 1.9.0, matplotlib 3.11.1,
 pyarrow, pytest.
 
-**Spec:** `docs/superpowers/specs/2026-09-20-pipeline-tratamento-dados-design.md`
+**Spec:** `docs/superpowers/specs/2026-09-20-pipeline-tratamento-data-design.md`
 
 ## Global Constraints
 
@@ -24,7 +24,7 @@ pyarrow, pytest.
   `src/read_type_methods.py`. Nenhum `os.getenv` fora deles.
 - `data/raw/` nunca é editada. É a testemunha.
 - Nada é descartado em silêncio: linhas removidas vão para
-  `data/interim/quarentena.parquet` com a coluna `motivo`.
+  `data/interim/quarantined.parquet` com a coluna `motivo`.
 - Códigos de saída: `0` sucesso (inclusive "nada sobreviveu aos filtros"), `1`
   erro de configuração ou entrada inválida, `130` Ctrl+C.
 - Grão do painel: `semana × materialOuServicoNome × classe`. `PANEL_FREQ=W`.
@@ -84,6 +84,9 @@ Ao fim dos dois arquivos (o `.env` usa CRLF — preserve):
 # MIN_CLASS_ITEMS    abaixo disso a classe não tem MAD confiável.
 # STATUS_FILTER      situação considerada gasto efetivo.
 # READ_CHUNK_ROWS    linhas lidas por fatia do CSV bruto.
+# DATA_DIR           raiz das três camadas de dados (raw, interim, processed).
+# RAW_CSV_NAME       nome do CSV que o coletor grava dentro de DATA_DIR/raw.
+# FIGURES_DIR        onde os gráficos PNG são gravados.
 # ===========================================================================
 PANEL_FREQ=W
 TOP_CLASSES=50
@@ -91,6 +94,9 @@ QTY_MAD_THRESHOLD=8
 MIN_CLASS_ITEMS=30
 STATUS_FILTER=Homologado
 READ_CHUNK_ROWS=200000
+DATA_DIR=data
+RAW_CSV_NAME=contract_items.csv
+FIGURES_DIR=reports/figures
 ```
 
 - [ ] **Step 3: escrever o teste que falha**
@@ -102,8 +108,8 @@ READ_CHUNK_ROWS=200000
 import sys
 from pathlib import Path
 
-RAIZ = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(RAIZ / "src"))
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
 ```
 
 `pytest.ini`:
@@ -121,10 +127,10 @@ from classes.pipeline_settings import PipelineSettings
 from read_type_methods import ConfigError
 
 
-def test_le_os_padroes(monkeypatch):
-    for chave in ("PANEL_FREQ", "TOP_CLASSES", "QTY_MAD_THRESHOLD",
+def test_reads_the_defaults(monkeypatch):
+    for key in ("PANEL_FREQ", "TOP_CLASSES", "QTY_MAD_THRESHOLD",
                   "MIN_CLASS_ITEMS", "STATUS_FILTER", "READ_CHUNK_ROWS"):
-        monkeypatch.delenv(chave, raising=False)
+        monkeypatch.delenv(key, raising=False)
     cfg = PipelineSettings.from_env()
     assert cfg.panel_freq == "W"
     assert cfg.top_classes == 50
@@ -133,7 +139,7 @@ def test_le_os_padroes(monkeypatch):
     assert cfg.status_filter == "Homologado"
 
 
-def test_caminhos_derivam_da_raiz_de_dados(monkeypatch):
+def test_paths_derive_from_the_data_root(monkeypatch):
     monkeypatch.setenv("DATA_DIR", "/tmp/dados-teste")
     cfg = PipelineSettings.from_env()
     assert cfg.raw_csv.as_posix() == "/tmp/dados-teste/raw/contract_items.csv"
@@ -141,20 +147,40 @@ def test_caminhos_derivam_da_raiz_de_dados(monkeypatch):
     assert cfg.processed_dir.as_posix() == "/tmp/dados-teste/processed"
 
 
-def test_env_e_ancorado_no_modulo():
-    """O .env precisa ser achado mesmo sem arquivo chamador (python -c, pytest)."""
-    from classes.pipeline_settings import CAMINHO_ENV
-    assert CAMINHO_ENV.name == ".env"
-    assert CAMINHO_ENV.parent.name == "src"
+def test_env_path_is_passed_to_load_dotenv(monkeypatch):
+    """Guards the behaviour, not the constant.
+
+    Asserting only that ENV_PATH points at src/.env would still pass if someone
+    kept the constant and reverted the call to a bare load_dotenv() — which is
+    the very defect this task closes. So the test checks that load_dotenv is
+    called WITH the anchored path.
+    """
+    import importlib
+
+    import dotenv
+
+    calls = []
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: calls.append((a, k)))
+
+    import classes.pipeline_settings as module
+    # reload re-executes `from dotenv import load_dotenv`, so the module binds
+    # the patched function instead of the one captured at first import.
+    importlib.reload(module)
+
+    assert calls, "load_dotenv não foi chamado"
+    assert calls[0][0], "load_dotenv foi chamado sem argumento — o .env seria ignorado"
+    assert calls[0][0][0] == module.ENV_PATH
+    assert module.ENV_PATH.name == ".env"
+    assert module.ENV_PATH.parent.name == "src"
 
 
-def test_recusa_top_classes_zero(monkeypatch):
+def test_rejects_top_classes_zero(monkeypatch):
     monkeypatch.setenv("TOP_CLASSES", "0")
     try:
         PipelineSettings.from_env()
         assert False, "deveria ter levantado ConfigError"
-    except ConfigError as erro:
-        assert "TOP_CLASSES" in str(erro)
+    except ConfigError as error:
+        assert "TOP_CLASSES" in str(error)
 ```
 
 - [ ] **Step 4: rodar e confirmar que falha**
@@ -192,11 +218,11 @@ from read_type_methods import _read_float_min, _read_int_min, _read_text
 # and every value silently becomes the dataclass default. Measured: a .env
 # saying MAX_WORKERS=2 read back as 3. For a data pipeline that is the worst
 # kind of failure, because the run succeeds with the wrong configuration.
-CAMINHO_ENV = Path(__file__).resolve().parent.parent / ".env"
-if CAMINHO_ENV.exists():
-    load_dotenv(CAMINHO_ENV)
+ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+if ENV_PATH.exists():
+    load_dotenv(ENV_PATH)
 else:
-    print(f"Aviso: {CAMINHO_ENV} não existe; usando apenas os valores padrão.")
+    print(f"Aviso: {ENV_PATH} não existe; usando apenas os valores padrão.")
 
 
 @dataclass
@@ -219,11 +245,11 @@ class PipelineSettings:
         """Builds a PipelineSettings from .env, validating as it goes."""
         # One root for all three layers, so a test run redirects everything by
         # setting a single variable.
-        raiz = Path(_read_text("DATA_DIR", "data"))
+        root = Path(_read_text("DATA_DIR", "data"))
         return cls(
-            raw_csv=raiz / "raw" / _read_text("RAW_CSV_NAME", "contract_items.csv"),
-            interim_dir=raiz / "interim",
-            processed_dir=raiz / "processed",
+            raw_csv=root / "raw" / _read_text("RAW_CSV_NAME", "contract_items.csv"),
+            interim_dir=root / "interim",
+            processed_dir=root / "processed",
             figures_dir=Path(_read_text("FIGURES_DIR", "reports/figures")),
             panel_freq=_read_text("PANEL_FREQ", "W"),
             # A floor of 1 everywhere a zero would make the stage meaningless:
@@ -263,14 +289,14 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `PipelineSettings` da Task 1
-- Produces: `carregar(caminho: Path, cfg: PipelineSettings) -> pd.DataFrame`.
+- Produces: `load_raw(path: Path, cfg: PipelineSettings) -> pd.DataFrame`.
   Devolve o grão de item, sem duplicatas, sem as três colunas mortas, filtrado
   por `cfg.status_filter`. As colunas numéricas (`quantidade`,
   `valorUnitarioEstimado`, `valorTotal`, `valorTotalResultado`) vêm como
   `float64` com `NaN` onde não havia valor. `dataInclusaoPncp` vem como
   `datetime64[ns]`. `codigoClasse` vem como `string` sem o sufixo `.0`.
-  Também exporta as constantes `COLUNAS_MORTAS: list[str]`,
-  `COLUNAS_NUMERICAS: list[str]` e `COLUNAS_TEXTO: list[str]`.
+  Também exporta as constantes `DEAD_COLUMNS: list[str]`,
+  `NUMERIC_COLUMNS: list[str]` e `TEXT_COLUMNS: list[str]`.
 
 - [ ] **Step 1: escrever o teste que falha**
 
@@ -281,63 +307,63 @@ import pandas as pd
 import pytest
 
 from classes.pipeline_settings import PipelineSettings
-from pipeline.load import carregar
+from pipeline.load import load_raw
 
-CABECALHO = ("idCompraItem,dataInclusaoPncp,codigoClasse,materialOuServicoNome,"
+HEADER = ("idCompraItem,dataInclusaoPncp,codigoClasse,materialOuServicoNome,"
              "situacaoCompraItemNome,itemCategoriaNome,temResultado,codigoGrupo,"
              "quantidade,valorUnitarioEstimado,valorTotal,valorTotalResultado\n")
 
 
-def _linha(ident, classe="7010.0", status="Homologado", qtd="10"):
+def _row(ident, classe="7010.0", status="Homologado", qtd="10"):
     return (f"{ident},2025-09-22T00:04:59,{classe},Material,{status},"
             f"Informática (TIC),True,,{qtd},100.0,1000.0,900.0\n")
 
 
 @pytest.fixture
 def cfg(tmp_path):
-    caminho = tmp_path / "raw" / "contract_items.csv"
-    caminho.parent.mkdir(parents=True)
-    caminho.write_text(
-        CABECALHO
-        + _linha("a1")
-        + _linha("a1")                          # duplicata exata
-        + _linha("a2")
-        + _linha("a3", status="Fracassado")     # filtrada pelo status
+    path = tmp_path / "raw" / "contract_items.csv"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        HEADER
+        + _row("a1")
+        + _row("a1")                          # duplicata exata
+        + _row("a2")
+        + _row("a3", status="Fracassado")     # filtrada pelo status
         , encoding="utf-8-sig")
     return PipelineSettings(
-        raw_csv=caminho, interim_dir=tmp_path / "interim",
+        raw_csv=path, interim_dir=tmp_path / "interim",
         processed_dir=tmp_path / "processed", figures_dir=tmp_path / "fig",
         read_chunk_rows=2)
 
 
-def test_remove_duplicatas_por_id(cfg):
-    df = carregar(cfg.raw_csv, cfg)
+def test_drops_duplicate_ids(cfg):
+    df = load_raw(cfg.raw_csv, cfg)
     assert df["idCompraItem"].is_unique
     assert set(df["idCompraItem"]) == {"a1", "a2"}
 
 
-def test_descarta_as_tres_colunas_mortas(cfg):
-    df = carregar(cfg.raw_csv, cfg)
+def test_drops_the_three_dead_columns(cfg):
+    df = load_raw(cfg.raw_csv, cfg)
     for morta in ("itemCategoriaNome", "temResultado", "codigoGrupo"):
         assert morta not in df.columns
 
 
-def test_filtra_pelo_status(cfg):
-    df = carregar(cfg.raw_csv, cfg)
+def test_filters_by_status(cfg):
+    df = load_raw(cfg.raw_csv, cfg)
     assert (df["situacaoCompraItemNome"] == "Homologado").all()
 
 
-def test_tipos_e_normalizacao(cfg):
-    df = carregar(cfg.raw_csv, cfg)
+def test_types_and_normalisation(cfg):
+    df = load_raw(cfg.raw_csv, cfg)
     assert df["quantidade"].dtype == "float64"
     assert pd.api.types.is_datetime64_any_dtype(df["dataInclusaoPncp"])
     # o CSV traz "7010.0"; o código é identificador, não número
     assert df["codigoClasse"].iloc[0] == "7010"
 
 
-def test_arquivo_ausente_da_mensagem_clara(cfg, tmp_path):
+def test_missing_file_gives_a_clear_message(cfg, tmp_path):
     with pytest.raises(FileNotFoundError, match="src/main.py"):
-        carregar(tmp_path / "nao-existe.csv", cfg)
+        load_raw(tmp_path / "nao-existe.csv", cfg)
 ```
 
 - [ ] **Step 2: rodar e confirmar que falha**
@@ -372,30 +398,30 @@ from classes.pipeline_settings import PipelineSettings
 # Cardinality 1 in the real data, or almost entirely absent. itemCategoriaNome
 # reads "Informática (TIC)" on every row of a dataset that contains goat meat
 # and antipsychotics — the API field is broken, not narrow.
-COLUNAS_MORTAS = ["itemCategoriaNome", "temResultado", "codigoGrupo"]
+DEAD_COLUMNS = ["itemCategoriaNome", "temResultado", "codigoGrupo"]
 
 # Identifiers, never arithmetic: read as text so a CNPJ keeps its leading zero.
-COLUNAS_TEXTO = ["idCompraItem", "orgaoEntidadeCnpj", "unidadeOrgaoCodigoUnidade",
+TEXT_COLUMNS = ["idCompraItem", "orgaoEntidadeCnpj", "unidadeOrgaoCodigoUnidade",
                  "codigoClasse", "codItemCatalogo"]
 
-COLUNAS_NUMERICAS = ["quantidade", "valorUnitarioEstimado", "valorTotal",
+NUMERIC_COLUMNS = ["quantidade", "valorUnitarioEstimado", "valorTotal",
                      "valorTotalResultado"]
 
 # Few distinct values each, repeated millions of times: `category` stores the
 # labels once and an integer per row, which is what keeps this in memory.
-COLUNAS_CATEGORIA = ["materialOuServicoNome", "materialOuServico", "unidadeMedida",
+CATEGORY_COLUMNS = ["materialOuServicoNome", "materialOuServico", "unidadeMedida",
                      "situacaoCompraItemNome", "nomeFornecedor"]
 
 
-def carregar(caminho: Path, cfg: PipelineSettings) -> pd.DataFrame:
+def load_raw(path: Path, cfg: PipelineSettings) -> pd.DataFrame:
     """Reads the raw CSV, deduplicates it, and returns the item grain."""
-    if not caminho.exists():
+    if not path.exists():
         raise FileNotFoundError(
-            f"{caminho} não existe. Rode o coletor primeiro: python src/main.py"
+            f"{path} não existe. Rode o coletor primeiro: python src/main.py"
         )
 
-    fatias = pd.read_csv(
-        caminho,
+    slices = pd.read_csv(
+        path,
         encoding="utf-8-sig",
         chunksize=cfg.read_chunk_rows,
         # The collector may be appending right now, leaving the last line half
@@ -403,35 +429,35 @@ def carregar(caminho: Path, cfg: PipelineSettings) -> pd.DataFrame:
         # is reported below.
         on_bad_lines="skip",
         parse_dates=["dataInclusaoPncp"],
-        dtype={c: "string" for c in COLUNAS_TEXTO},
+        dtype={c: "string" for c in TEXT_COLUMNS},
         low_memory=False,
     )
-    df = pd.concat(list(fatias), ignore_index=True)
+    df = pd.concat(list(slices), ignore_index=True)
 
-    lidas = len(df)
+    read_rows = len(df)
     # One extra pass over the file, a few seconds, to tell a skipped line from a
     # line that was never there.
-    with caminho.open("rb") as fh:
-        no_arquivo = sum(1 for _ in fh) - 1
-    if no_arquivo > lidas:
-        print(f"Aviso: {no_arquivo - lidas:,} linha(s) do CSV foram puladas por "
+    with path.open("rb") as fh:
+        in_file = sum(1 for _ in fh) - 1
+    if in_file > read_rows:
+        print(f"Aviso: {in_file - read_rows:,} linha(s) do CSV foram puladas por "
               f"estarem malformadas (provavelmente a última, se o coletor está rodando).")
 
-    df = df.drop(columns=[c for c in COLUNAS_MORTAS if c in df.columns])
+    df = df.drop(columns=[c for c in DEAD_COLUMNS if c in df.columns])
 
     # Rule 0: the collector re-downloads an interrupted chunk and appends its
     # rows a second time, so the raw layer legitimately holds duplicates.
     # idCompraItem is the API's unique key.
-    antes = len(df)
+    before = len(df)
     df = df.drop_duplicates("idCompraItem", keep="first")
-    if antes > len(df):
-        print(f"{antes - len(df):,} linha(s) duplicada(s) removida(s) "
-              f"({(antes - len(df)) / antes:.1%} do arquivo).")
+    if before > len(df):
+        print(f"{before - len(df):,} linha(s) duplicada(s) removida(s) "
+              f"({(before - len(df)) / before:.1%} do arquivo).")
 
-    for coluna in COLUNAS_NUMERICAS:
+    for column in NUMERIC_COLUMNS:
         # errors="coerce": an empty cell becomes NaN instead of raising. Items
         # that were never awarded have no valorTotalResultado at all.
-        df[coluna] = pd.to_numeric(df[coluna], errors="coerce")
+        df[column] = pd.to_numeric(df[column], errors="coerce")
 
     # The API writes class codes as floats ("7010.0"). They are identifiers.
     if "codigoClasse" in df.columns:
@@ -439,13 +465,13 @@ def carregar(caminho: Path, cfg: PipelineSettings) -> pd.DataFrame:
                               .str.replace(r"\.0$", "", regex=True)
                               .astype("string"))
 
-    for coluna in COLUNAS_CATEGORIA:
-        if coluna in df.columns:
-            df[coluna] = df[coluna].astype("category")
+    for column in CATEGORY_COLUMNS:
+        if column in df.columns:
+            df[column] = df[column].astype("category")
 
-    antes = len(df)
+    before = len(df)
     df = df[df["situacaoCompraItemNome"] == cfg.status_filter]
-    print(f"{antes - len(df):,} linha(s) fora de '{cfg.status_filter}' removida(s); "
+    print(f"{before - len(df):,} linha(s) fora de '{cfg.status_filter}' removida(s); "
           f"{len(df):,} restantes.")
 
     return df.reset_index(drop=True)
@@ -474,12 +500,12 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Test: `tests/pipeline/test_clean.py`
 
 **Interfaces:**
-- Consumes: o DataFrame de `carregar()` (Task 2), `PipelineSettings` (Task 1)
-- Produces: `limpar(df: pd.DataFrame, cfg: PipelineSettings) -> tuple[pd.DataFrame, pd.DataFrame]`.
-  Devolve `(limpos, quarentena)`. A quarentena tem todas as colunas de entrada
+- Consumes: o DataFrame de `load_raw()` (Task 2), `PipelineSettings` (Task 1)
+- Produces: `clean(df: pd.DataFrame, cfg: PipelineSettings) -> tuple[pd.DataFrame, pd.DataFrame]`.
+  Devolve `(kept, quarantined)`. A quarentena tem todas as colunas de entrada
   mais `motivo: str` e `z_quantidade: float`. Invariante:
-  `len(limpos) + len(quarentena) == len(df)`.
-  Também exporta `MOTIVO_QUANTIDADE: str = "quantidade implausível na classe"`.
+  `len(kept) + len(quarantined) == len(df)`.
+  Também exporta `REASON_QUANTITY: str = "quantidade implausível na classe"`.
 
 - [ ] **Step 1: escrever o teste que falha**
 
@@ -491,7 +517,7 @@ import pandas as pd
 import pytest
 
 from classes.pipeline_settings import PipelineSettings
-from pipeline.clean import MOTIVO_QUANTIDADE, limpar
+from pipeline.clean import REASON_QUANTITY, clean
 
 
 @pytest.fixture
@@ -502,8 +528,8 @@ def cfg(tmp_path):
         qty_mad_threshold=8.0, min_class_items=30)
 
 
-def _frame(linhas):
-    return pd.DataFrame(linhas, columns=[
+def _frame(rows):
+    return pd.DataFrame(rows, columns=[
         "idCompraItem", "codigoClasse", "materialOuServicoNome",
         "quantidade", "valorUnitarioEstimado", "valorTotalResultado"])
 
@@ -517,63 +543,63 @@ def base():
     return _frame(normais)
 
 
-def test_quarentena_pega_quantidade_impossivel(cfg, base):
+def test_quarantines_impossible_quantity(cfg, base):
     # o caso real: 11.880.000 tablets a R$ 1.550
-    suspeito = _frame([("tablet", "7010", "Material",
+    suspect = _frame([("tablet", "7010", "Material",
                         11_880_000.0, 1550.0, 18_414_000_000.0)])
-    limpos, quarentena = limpar(pd.concat([base, suspeito], ignore_index=True), cfg)
-    assert list(quarentena["idCompraItem"]) == ["tablet"]
-    assert quarentena["motivo"].iloc[0] == MOTIVO_QUANTIDADE
-    assert "tablet" not in set(limpos["idCompraItem"])
+    kept, quarantined = clean(pd.concat([base, suspect], ignore_index=True), cfg)
+    assert list(quarantined["idCompraItem"]) == ["tablet"]
+    assert quarantined["motivo"].iloc[0] == REASON_QUANTITY
+    assert "tablet" not in set(kept["idCompraItem"])
 
 
-def test_legitimos_sobrevivem(cfg, base):
+def test_legitimate_rows_survive(cfg, base):
     # 50 ressonâncias a R$ 8,25 mi e 3.000 ambulâncias a R$ 277 mil
-    legitimos = _frame([
+    legitimate = _frame([
         ("ressonancia", "7010", "Material", 50.0, 8_254_384.14, 303_286_600.0),
         ("ambulancia", "7010", "Material", 3000.0, 277_807.0, 824_931_000.0),
     ])
-    limpos, quarentena = limpar(pd.concat([base, legitimos], ignore_index=True), cfg)
-    assert {"ressonancia", "ambulancia"} <= set(limpos["idCompraItem"])
-    assert quarentena.empty
+    kept, quarantined = clean(pd.concat([base, legitimate], ignore_index=True), cfg)
+    assert {"ressonancia", "ambulancia"} <= set(kept["idCompraItem"])
+    assert quarantined.empty
 
 
-def test_mad_zero_nao_dispara(cfg):
+def test_zero_mad_does_not_fire(cfg):
     """Classe de serviço onde toda quantidade é 1: MAD = 0, regra não se aplica."""
-    servicos = _frame([(f"s{i}", "sem-classe", "Serviço", 1.0, 1000.0, 1000.0)
+    services = _frame([(f"s{i}", "sem-classe", "Serviço", 1.0, 1000.0, 1000.0)
                        for i in range(40)])
-    obra = _frame([("obra", "sem-classe", "Serviço",
+    works = _frame([("obra", "sem-classe", "Serviço",
                     1.0, 616_720_624.99, 604_989_321.0)])
-    limpos, quarentena = limpar(pd.concat([servicos, obra], ignore_index=True), cfg)
-    assert quarentena.empty
-    assert "obra" in set(limpos["idCompraItem"])
+    kept, quarantined = clean(pd.concat([services, works], ignore_index=True), cfg)
+    assert quarantined.empty
+    assert "obra" in set(kept["idCompraItem"])
 
 
-def test_regra_e_unilateral(cfg, base):
+def test_rule_is_one_sided(cfg, base):
     """Quantidade muito BAIXA não é marcada: não infla total nenhum."""
-    minusculo = _frame([("fracao", "7010", "Material", 0.001, 2000.0, 2.0)])
-    limpos, quarentena = limpar(pd.concat([base, minusculo], ignore_index=True), cfg)
-    assert quarentena.empty
-    assert "fracao" in set(limpos["idCompraItem"])
+    tiny = _frame([("fracao", "7010", "Material", 0.001, 2000.0, 2.0)])
+    kept, quarantined = clean(pd.concat([base, tiny], ignore_index=True), cfg)
+    assert quarantined.empty
+    assert "fracao" in set(kept["idCompraItem"])
 
 
-def test_nada_evapora(cfg, base):
-    suspeito = _frame([("tablet", "7010", "Material",
+def test_nothing_evaporates(cfg, base):
+    suspect = _frame([("tablet", "7010", "Material",
                         11_880_000.0, 1550.0, 18_414_000_000.0)])
-    entrada = pd.concat([base, suspeito], ignore_index=True)
-    limpos, quarentena = limpar(entrada, cfg)
-    assert len(limpos) + len(quarentena) == len(entrada)
+    entry = pd.concat([base, suspect], ignore_index=True)
+    kept, quarantined = clean(entry, cfg)
+    assert len(kept) + len(quarantined) == len(entry)
 
 
-def test_classe_pequena_usa_estatistica_global(cfg, base):
+def test_small_class_borrows_global_stats(cfg, base):
     """Uma classe com 2 itens não tem MAD confiável; cai para o global."""
-    pequena = _frame([
+    small = _frame([
         ("p1", "9999", "Material", 5.0, 100.0, 500.0),
         ("p2", "9999", "Material", 50_000_000.0, 100.0, 5_000_000_000.0),
     ])
-    limpos, quarentena = limpar(pd.concat([base, pequena], ignore_index=True), cfg)
-    assert "p2" in set(quarentena["idCompraItem"])
-    assert "p1" in set(limpos["idCompraItem"])
+    kept, quarantined = clean(pd.concat([base, small], ignore_index=True), cfg)
+    assert "p2" in set(quarantined["idCompraItem"])
+    assert "p1" in set(kept["idCompraItem"])
 ```
 
 - [ ] **Step 2: rodar e confirmar que falha**
@@ -610,76 +636,76 @@ import pandas as pd
 
 from classes.pipeline_settings import PipelineSettings
 
-MOTIVO_QUANTIDADE = "quantidade implausível na classe"
+REASON_QUANTITY = "quantidade implausível na classe"
 
 # Scale factor that makes the median absolute deviation a consistent estimator
 # of the standard deviation for normally distributed data. Without it the
 # threshold would not be comparable to a z-score.
-ESCALA_MAD = 1.4826
+MAD_SCALE = 1.4826
 
 
-def _mad(serie: pd.Series) -> float:
+def _mad(series: pd.Series) -> float:
     """Median absolute deviation: a spread measure the outliers cannot inflate."""
-    return float((serie - serie.median()).abs().median())
+    return float((series - series.median()).abs().median())
 
 
-def limpar(df: pd.DataFrame, cfg: PipelineSettings) -> tuple[pd.DataFrame, pd.DataFrame]:
+def clean(df: pd.DataFrame, cfg: PipelineSettings) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Splits the frame into (kept, quarantined). Removes nothing silently."""
-    trabalho = df.copy()
+    work = df.copy()
 
     # log10 because quantities span nine orders of magnitude, from 1 unit to
     # 867 million. On the linear scale the median is meaningless.
-    trabalho["_log_qtd"] = np.log10(
-        trabalho["quantidade"].where(trabalho["quantidade"] > 0)
+    work["_log_qtd"] = np.log10(
+        work["quantidade"].where(work["quantidade"] > 0)
     )
 
     # dropna=False keeps the missing-class rows as their own group: 19% of the
     # data has no codigoClasse, and it includes the civil works contracts.
-    grupo = trabalho.groupby("codigoClasse", dropna=False, observed=True)["_log_qtd"]
-    mediana = grupo.transform("median")
-    mad = grupo.transform(_mad)
-    tamanho = grupo.transform("size")
+    group = work.groupby("codigoClasse", dropna=False, observed=True)["_log_qtd"]
+    median = group.transform("median")
+    mad = group.transform(_mad)
+    size = group.transform("size")
 
-    mediana_global = trabalho["_log_qtd"].median()
-    mad_global = _mad(trabalho["_log_qtd"].dropna())
+    global_median = work["_log_qtd"].median()
+    global_mad = _mad(work["_log_qtd"].dropna())
 
     # A class whose quantities are all identical has MAD 0, and dividing by it
     # would flag every row that differs at all. Service classes are like this —
     # quantity is 1 on nearly every contract — and they are exactly where the
     # legitimate R$ 604 million works sit. The rule simply does not apply there.
-    sem_estatistica = mad.isna() | (mad == 0)
+    no_spread = mad.isna() | (mad == 0)
 
     # A class with a handful of items has a median and a MAD, but neither means
     # anything. Borrow the global distribution instead.
-    classe_pequena = (tamanho < cfg.min_class_items) & ~sem_estatistica
+    small_class = (size < cfg.min_class_items) & ~no_spread
 
-    mediana_efetiva = mediana.where(~classe_pequena, mediana_global)
-    mad_efetivo = mad.where(~classe_pequena, mad_global)
+    effective_median = median.where(~small_class, global_median)
+    effective_mad = mad.where(~small_class, global_mad)
 
-    z = (trabalho["_log_qtd"] - mediana_efetiva) / (ESCALA_MAD * mad_efetivo)
+    z = (work["_log_qtd"] - effective_median) / (MAD_SCALE * effective_mad)
 
     # One-sided on purpose. A quantity that is too small understates a total and
     # cannot produce the R$ 226 billion artefact; and quantity 1 is the norm for
     # works and continuing services. Only the high tail is suspect.
     # NaN comparisons are False, so rows without a usable quantity are kept.
-    suspeito = (z > cfg.qty_mad_threshold) & ~sem_estatistica
-    if mad_global == 0:
+    suspect = (z > cfg.qty_mad_threshold) & ~no_spread
+    if global_mad == 0:
         # Degenerate input: every quantity in the frame is identical.
-        suspeito = pd.Series(False, index=trabalho.index)
+        suspect = pd.Series(False, index=work.index)
 
-    quarentena = trabalho[suspeito].copy()
-    quarentena["motivo"] = MOTIVO_QUANTIDADE
-    quarentena["z_quantidade"] = z[suspeito]
+    quarantined = work[suspect].copy()
+    quarantined["motivo"] = REASON_QUANTITY
+    quarantined["z_quantidade"] = z[suspect]
 
-    limpos = trabalho[~suspeito].drop(columns="_log_qtd")
-    quarentena = quarentena.drop(columns="_log_qtd")
+    kept = work[~suspect].drop(columns="_log_qtd")
+    quarantined = quarantined.drop(columns="_log_qtd")
 
-    if len(quarentena):
-        valor = quarentena["valorTotalResultado"].sum()
-        print(f"{len(quarentena):,} item(ns) em quarentena por quantidade "
-              f"implausível, somando R$ {valor:,.2f}.")
+    if len(quarantined):
+        value = quarantined["valorTotalResultado"].sum()
+        print(f"{len(quarantined):,} item(ns) em quarentena por quantidade "
+              f"implausível, somando R$ {value:,.2f}.")
 
-    return limpos.reset_index(drop=True), quarentena.reset_index(drop=True)
+    return kept.reset_index(drop=True), quarantined.reset_index(drop=True)
 ```
 
 - [ ] **Step 4: rodar e confirmar que passa**
@@ -705,14 +731,14 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Test: `tests/pipeline/test_aggregate.py`
 
 **Interfaces:**
-- Consumes: `limpos` de `limpar()` (Task 3), `PipelineSettings` (Task 1)
-- Produces: `para_painel(df: pd.DataFrame, cfg: PipelineSettings) -> pd.DataFrame`
+- Consumes: `kept` de `clean()` (Task 3), `PipelineSettings` (Task 1)
+- Produces: `to_panel(df: pd.DataFrame, cfg: PipelineSettings) -> pd.DataFrame`
   com as colunas `semana` (`period[W]`), `materialOuServicoNome` (str),
   `classe` (str), `valor_total`, `n_itens`, `qtd_total`, `qtd_mediana`,
   `preco_unitario_mediano`, `valor_estimado_total`, `taxa_desconto`,
   `n_fornecedores`, `n_orgaos`. Retângulo completo: exatamente
-  `n_semanas × n_combinações` linhas. Também exporta
-  `BALDE_OUTRAS: str = "Outras"` e `BALDE_SEM_CLASSE: str = "Sem classe"`.
+  `n_weeks × n_combinações` linhas. Também exporta
+  `BUCKET_OTHER: str = "Outras"` e `BUCKET_NO_CLASS: str = "Sem classe"`.
 
 - [ ] **Step 1: escrever o teste que falha**
 
@@ -723,7 +749,7 @@ import pandas as pd
 import pytest
 
 from classes.pipeline_settings import PipelineSettings
-from pipeline.aggregate import BALDE_OUTRAS, BALDE_SEM_CLASSE, para_painel
+from pipeline.aggregate import BUCKET_OTHER, BUCKET_NO_CLASS, to_panel
 
 
 @pytest.fixture
@@ -734,8 +760,8 @@ def cfg(tmp_path):
         panel_freq="W", top_classes=2)
 
 
-def _itens(linhas):
-    df = pd.DataFrame(linhas, columns=[
+def _items(rows):
+    df = pd.DataFrame(rows, columns=[
         "dataInclusaoPncp", "codigoClasse", "materialOuServicoNome",
         "quantidade", "valorUnitarioEstimado", "valorTotal",
         "valorTotalResultado", "nomeFornecedor", "orgaoEntidadeCnpj"])
@@ -743,71 +769,71 @@ def _itens(linhas):
     return df
 
 
-def test_soma_preservada(cfg):
-    itens = _itens([
+def test_sum_is_preserved(cfg):
+    itens = _items([
         ("2025-01-02", "A", "Material", 2.0, 50.0, 100.0, 90.0, "f1", "o1"),
         ("2025-01-03", "A", "Material", 4.0, 50.0, 200.0, 180.0, "f2", "o1"),
     ])
-    painel = para_painel(itens, cfg)
-    assert painel["valor_total"].sum() == pytest.approx(270.0)
-    assert painel["n_itens"].sum() == 2
+    panel = to_panel(itens, cfg)
+    assert panel["valor_total"].sum() == pytest.approx(270.0)
+    assert panel["n_itens"].sum() == 2
 
 
-def test_painel_e_retangulo_completo(cfg):
+def test_panel_is_a_full_rectangle(cfg):
     """Uma classe compra na semana 1, a outra na semana 3. O painel tem as duas
     em todas as três semanas, com zero onde não houve compra."""
-    itens = _itens([
+    itens = _items([
         ("2025-01-02", "A", "Material", 1.0, 10.0, 10.0, 10.0, "f1", "o1"),
         ("2025-01-16", "B", "Serviço", 1.0, 20.0, 20.0, 20.0, "f2", "o2"),
     ])
-    painel = para_painel(itens, cfg)
-    n_semanas = painel["semana"].nunique()
-    n_combos = painel[["materialOuServicoNome", "classe"]].drop_duplicates().shape[0]
-    assert len(painel) == n_semanas * n_combos
-    assert n_semanas == 3
-    assert (painel["valor_total"] == 0).sum() == len(painel) - 2
+    panel = to_panel(itens, cfg)
+    n_weeks = panel["semana"].nunique()
+    n_combos = panel[["materialOuServicoNome", "classe"]].drop_duplicates().shape[0]
+    assert len(panel) == n_weeks * n_combos
+    assert n_weeks == 3
+    assert (panel["valor_total"] == 0).sum() == len(panel) - 2
 
 
-def test_reduz_para_top_classes(cfg):
+def test_reduces_to_top_classes(cfg):
     """top_classes=2: as duas maiores por valor ficam, o resto vira "Outras"."""
-    itens = _itens([
+    itens = _items([
         ("2025-01-02", "A", "Material", 1.0, 1.0, 1.0, 1000.0, "f", "o"),
         ("2025-01-02", "B", "Material", 1.0, 1.0, 1.0, 500.0, "f", "o"),
         ("2025-01-02", "C", "Material", 1.0, 1.0, 1.0, 10.0, "f", "o"),
         ("2025-01-02", "D", "Material", 1.0, 1.0, 1.0, 5.0, "f", "o"),
     ])
-    painel = para_painel(itens, cfg)
-    classes = set(painel["classe"])
-    assert {"A", "B", BALDE_OUTRAS} <= classes
+    panel = to_panel(itens, cfg)
+    classes = set(panel["classe"])
+    assert {"A", "B", BUCKET_OTHER} <= classes
     assert "C" not in classes and "D" not in classes
 
 
-def test_classe_ausente_vira_balde_proprio(cfg):
-    itens = _itens([
+def test_missing_class_gets_its_own_bucket(cfg):
+    itens = _items([
         ("2025-01-02", None, "Serviço", 1.0, 100.0, 100.0, 100.0, "f", "o"),
     ])
-    painel = para_painel(itens, cfg)
-    assert BALDE_SEM_CLASSE in set(painel["classe"])
+    panel = to_panel(itens, cfg)
+    assert BUCKET_NO_CLASS in set(panel["classe"])
 
 
-def test_material_e_servico_permanecem_na_chave(cfg):
+def test_material_and_service_stay_in_the_key(cfg):
     """Os baldes misturam M e S, então a divisão só é recuperável com a coluna
     na chave de agrupamento."""
-    itens = _itens([
+    itens = _items([
         ("2025-01-02", None, "Material", 1.0, 1.0, 1.0, 10.0, "f", "o"),
         ("2025-01-02", None, "Serviço", 1.0, 1.0, 1.0, 20.0, "f", "o"),
     ])
-    painel = para_painel(itens, cfg)
-    sem_classe = painel[painel["classe"] == BALDE_SEM_CLASSE]
-    assert set(sem_classe["materialOuServicoNome"]) == {"Material", "Serviço"}
+    panel = to_panel(itens, cfg)
+    no_class = panel[panel["classe"] == BUCKET_NO_CLASS]
+    assert set(no_class["materialOuServicoNome"]) == {"Material", "Serviço"}
 
 
-def test_taxa_de_desconto(cfg):
-    itens = _itens([
+def test_discount_rate(cfg):
+    itens = _items([
         ("2025-01-02", "A", "Material", 1.0, 100.0, 100.0, 80.0, "f", "o"),
     ])
-    painel = para_painel(itens, cfg)
-    linha = painel[painel["valor_total"] > 0].iloc[0]
+    panel = to_panel(itens, cfg)
+    linha = panel[panel["valor_total"] > 0].iloc[0]
     assert linha["taxa_desconto"] == pytest.approx(0.8)
 ```
 
@@ -841,37 +867,37 @@ import pandas as pd
 
 from classes.pipeline_settings import PipelineSettings
 
-BALDE_OUTRAS = "Outras"
-BALDE_SEM_CLASSE = "Sem classe"
+BUCKET_OTHER = "Outras"
+BUCKET_NO_CLASS = "Sem classe"
 
 
-def _reduzir_classes(df: pd.DataFrame, cfg: PipelineSettings) -> pd.Series:
+def _reduce_classes(df: pd.DataFrame, cfg: PipelineSettings) -> pd.Series:
     """Keeps the top classes by awarded value; everything else gets a bucket."""
     classe = df["codigoClasse"].astype("object")
-    ausente = classe.isna()
+    missing = classe.isna()
 
-    ranking = (df.loc[~ausente]
-               .groupby(classe[~ausente], observed=True)["valorTotalResultado"]
+    ranking = (df.loc[~missing]
+               .groupby(classe[~missing], observed=True)["valorTotalResultado"]
                .sum()
                .sort_values(ascending=False))
-    mantidas = set(ranking.head(cfg.top_classes).index)
+    kept_classes = set(ranking.head(cfg.top_classes).index)
 
-    reduzida = classe.where(classe.isin(mantidas), BALDE_OUTRAS)
+    reduced = classe.where(classe.isin(kept_classes), BUCKET_OTHER)
     # The missing-class bucket is kept separate from "Outras" because the two
     # mean different things: one is a small class, the other is no class at all.
-    return reduzida.mask(ausente, BALDE_SEM_CLASSE).astype("string")
+    return reduced.mask(missing, BUCKET_NO_CLASS).astype("string")
 
 
-def para_painel(df: pd.DataFrame, cfg: PipelineSettings) -> pd.DataFrame:
+def to_panel(df: pd.DataFrame, cfg: PipelineSettings) -> pd.DataFrame:
     """Aggregates the item grain into semana × material/serviço × classe."""
-    trabalho = df.copy()
-    trabalho["semana"] = trabalho["dataInclusaoPncp"].dt.to_period(cfg.panel_freq)
-    trabalho["classe"] = _reduzir_classes(trabalho, cfg)
-    trabalho["materialOuServicoNome"] = (trabalho["materialOuServicoNome"]
+    work = df.copy()
+    work["semana"] = work["dataInclusaoPncp"].dt.to_period(cfg.panel_freq)
+    work["classe"] = _reduce_classes(work, cfg)
+    work["materialOuServicoNome"] = (work["materialOuServicoNome"]
                                          .astype("string"))
 
-    chave = ["semana", "materialOuServicoNome", "classe"]
-    painel = trabalho.groupby(chave, observed=True).agg(
+    key = ["semana", "materialOuServicoNome", "classe"]
+    panel = work.groupby(key, observed=True).agg(
         valor_total=("valorTotalResultado", "sum"),
         n_itens=("valorTotalResultado", "size"),
         qtd_total=("quantidade", "sum"),
@@ -884,26 +910,26 @@ def para_painel(df: pd.DataFrame, cfg: PipelineSettings) -> pd.DataFrame:
 
     # The rectangle. Every observed (material/serviço, classe) pair crossed with
     # every week in the range, so a lag always steps exactly one period back.
-    combos = painel[["materialOuServicoNome", "classe"]].drop_duplicates()
-    semanas = pd.period_range(painel["semana"].min(), painel["semana"].max(),
+    combos = panel[["materialOuServicoNome", "classe"]].drop_duplicates()
+    weeks = pd.period_range(panel["semana"].min(), panel["semana"].max(),
                               freq=cfg.panel_freq)
-    grade = combos.merge(pd.DataFrame({"semana": semanas}), how="cross")
-    painel = grade.merge(painel, on=chave, how="left")
+    full_grid = combos.merge(pd.DataFrame({"semana": weeks}), how="cross")
+    panel = full_grid.merge(panel, on=key, how="left")
 
     # A week with no purchase is a zero, not a gap: the money and the count are
     # genuinely zero.
-    for coluna in ("valor_total", "n_itens", "qtd_total", "valor_estimado_total",
+    for column in ("valor_total", "n_itens", "qtd_total", "valor_estimado_total",
                    "n_fornecedores", "n_orgaos"):
-        painel[coluna] = painel[coluna].fillna(0)
+        panel[column] = panel[column].fillna(0)
     # Medians of an empty set stay NaN — there was no price to observe, which is
     # not the same as a price of zero.
 
     # How much of the estimate the government actually paid. Measured median in
     # the real data: 0,826.
-    painel["taxa_desconto"] = (painel["valor_total"]
-                               / painel["valor_estimado_total"].replace(0, pd.NA))
+    panel["taxa_desconto"] = (panel["valor_total"]
+                               / panel["valor_estimado_total"].replace(0, pd.NA))
 
-    return painel.sort_values(["semana"] + chave[1:]).reset_index(drop=True)
+    return panel.sort_values(["semana"] + key[1:]).reset_index(drop=True)
 ```
 
 - [ ] **Step 4: rodar e confirmar que passa**
@@ -929,15 +955,15 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Test: `tests/pipeline/test_features.py`
 
 **Interfaces:**
-- Consumes: o painel de `para_painel()` (Task 4)
-- Produces: `criar_features(painel: pd.DataFrame, cfg: PipelineSettings) -> pd.DataFrame`
+- Consumes: o painel de `to_panel()` (Task 4)
+- Produces: `build_features(panel: pd.DataFrame, cfg: PipelineSettings) -> pd.DataFrame`
   com as colunas de entrada mais `tendencia` (int), `semana_do_ano` (int),
   `mes` (int), `sazonal_sen` (float), `sazonal_cos` (float),
   `valor_lag_1`, `valor_lag_4`, `valor_lag_52`, `itens_lag_1`, `itens_lag_4`,
   `itens_lag_52`, `valor_media_4`, `itens_media_4`. Também exporta
-  `COLUNAS_CATEGORICAS: list[str]` e a função
-  `colunas_numericas(cfg: PipelineSettings) -> list[str]`, que devolve os nomes
-  das features numéricas que `criar_features` produz para a frequência
+  `CATEGORICAL_FEATURES: list[str]` e a função
+  `numeric_features(cfg: PipelineSettings) -> list[str]`, que devolve os nomes
+  das features numéricas que `build_features` produz para a frequência
   configurada. A Task 7 consome as duas. Há uma fonte de verdade só: a função,
   nunca uma constante paralela — com `PANEL_FREQ=M` a defasagem anual se chama
   `valor_lag_12`, e uma lista fixa apontaria para colunas que não existem.
@@ -951,8 +977,8 @@ import pandas as pd
 import pytest
 
 from classes.pipeline_settings import PipelineSettings
-from pipeline.features import (COLUNAS_CATEGORICAS, colunas_numericas,
-                               criar_features)
+from pipeline.features import (CATEGORICAL_FEATURES, numeric_features,
+                               build_features)
 
 
 @pytest.fixture
@@ -963,67 +989,67 @@ def cfg(tmp_path):
 
 
 @pytest.fixture
-def painel():
-    semanas = pd.period_range("2025-01-06", periods=8, freq="W")
-    linhas = []
-    for i, semana in enumerate(semanas):
+def panel():
+    weeks = pd.period_range("2025-01-06", periods=8, freq="W")
+    rows = []
+    for i, semana in enumerate(weeks):
         for combo in (("Material", "A"), ("Serviço", "B")):
-            linhas.append({
+            rows.append({
                 "semana": semana, "materialOuServicoNome": combo[0],
                 "classe": combo[1], "valor_total": float((i + 1) * 100),
                 "n_itens": i + 1, "qtd_total": 10.0, "qtd_mediana": 2.0,
                 "preco_unitario_mediano": 50.0,
                 "valor_estimado_total": float((i + 1) * 120),
                 "n_fornecedores": 2, "n_orgaos": 1, "taxa_desconto": 0.83})
-    return pd.DataFrame(linhas)
+    return pd.DataFrame(rows)
 
 
-def test_lags_olham_para_tras(cfg, painel):
-    saida = criar_features(painel, cfg)
-    linha_a = saida[(saida["classe"] == "A")].sort_values("semana")
+def test_lags_look_backwards(cfg, panel):
+    out = build_features(panel, cfg)
+    row_a = out[(out["classe"] == "A")].sort_values("semana")
     # a terceira semana tem valor 300 e o lag_1 dela é 200
-    assert linha_a["valor_total"].iloc[2] == 300.0
-    assert linha_a["valor_lag_1"].iloc[2] == 200.0
+    assert row_a["valor_total"].iloc[2] == 300.0
+    assert row_a["valor_lag_1"].iloc[2] == 200.0
     # a primeira semana não tem passado
-    assert pd.isna(linha_a["valor_lag_1"].iloc[0])
+    assert pd.isna(row_a["valor_lag_1"].iloc[0])
 
 
-def test_lag_nao_atravessa_combinacoes(cfg, painel):
+def test_lag_does_not_cross_combinations(cfg, panel):
     """O lag da classe A nunca pega valor da classe B."""
-    painel = painel.copy()
-    painel.loc[painel["classe"] == "B", "valor_total"] = 9999.0
-    saida = criar_features(painel, cfg)
-    linha_a = saida[saida["classe"] == "A"].sort_values("semana")
-    assert (linha_a["valor_lag_1"].dropna() != 9999.0).all()
+    panel = panel.copy()
+    panel.loc[panel["classe"] == "B", "valor_total"] = 9999.0
+    out = build_features(panel, cfg)
+    row_a = out[out["classe"] == "A"].sort_values("semana")
+    assert (row_a["valor_lag_1"].dropna() != 9999.0).all()
 
 
-def test_lag_52_vazio_com_um_ano(cfg, painel):
+def test_lag_52_is_empty_with_one_year(cfg, panel):
     """Documenta a limitação: 8 semanas de painel, lag_52 inteiramente nulo."""
-    saida = criar_features(painel, cfg)
-    assert saida["valor_lag_52"].isna().all()
+    out = build_features(panel, cfg)
+    assert out["valor_lag_52"].isna().all()
 
 
-def test_features_de_calendario(cfg, painel):
-    saida = criar_features(painel, cfg)
-    assert saida["tendencia"].min() == 0
-    assert saida["semana_do_ano"].between(1, 53).all()
-    assert saida["sazonal_sen"].between(-1, 1).all()
+def test_calendar_features(cfg, panel):
+    out = build_features(panel, cfg)
+    assert out["tendencia"].min() == 0
+    assert out["semana_do_ano"].between(1, 53).all()
+    assert out["sazonal_sen"].between(-1, 1).all()
 
 
-def test_listas_de_colunas_existem_na_saida(cfg, painel):
+def test_declared_columns_exist_in_the_output(cfg, panel):
     """Tudo que colunas_numericas() promete precisa existir de fato."""
-    saida = criar_features(painel, cfg)
-    for coluna in COLUNAS_CATEGORICAS + colunas_numericas(cfg):
-        assert coluna in saida.columns, coluna
+    out = build_features(panel, cfg)
+    for column in CATEGORICAL_FEATURES + numeric_features(cfg):
+        assert column in out.columns, column
 
 
-def test_frequencia_mensal_muda_o_nome_da_defasagem_anual(cfg, painel):
+def test_monthly_frequency_renames_the_annual_lag(cfg, panel):
     """A razão de a lista ser função e não constante."""
     import dataclasses
     mensal = dataclasses.replace(cfg, panel_freq="M")
-    assert "valor_lag_12" in colunas_numericas(mensal)
-    assert "valor_lag_52" not in colunas_numericas(mensal)
-    assert "valor_lag_52" in colunas_numericas(cfg)
+    assert "valor_lag_12" in numeric_features(mensal)
+    assert "valor_lag_52" not in numeric_features(mensal)
+    assert "valor_lag_52" in numeric_features(cfg)
 ```
 
 - [ ] **Step 2: rodar e confirmar que falha**
@@ -1060,89 +1086,89 @@ import pandas as pd
 from classes.pipeline_settings import PipelineSettings
 
 # Consumed by transform.py to build the ColumnTransformer.
-COLUNAS_CATEGORICAS = ["materialOuServicoNome", "classe"]
+CATEGORICAL_FEATURES = ["materialOuServicoNome", "classe"]
 
-CHAVE_COMBO = ["materialOuServicoNome", "classe"]
+COMBO_KEY = ["materialOuServicoNome", "classe"]
 
 # Periods in one year, per panel frequency. This is what makes the seasonal
 # cycle and the annual lag follow PANEL_FREQ instead of assuming weeks: with a
 # hardcoded 52 a monthly panel would compute a twelve-times-too-long cycle and
 # an annual lag that reaches four years back.
-PERIODOS_POR_ANO = {"W": 52, "M": 12, "Q": 4, "D": 365}
-PERIODOS_POR_ANO_PADRAO = 52
+PERIODS_PER_YEAR = {"W": 52, "M": 12, "Q": 4, "D": 365}
+PERIODS_PER_YEAR_DEFAULT = 52
 
 # Short lags for the near horizon; the annual one is added from the frequency.
-DEFASAGENS_CURTAS = (1, 4)
-JANELA_MEDIA = 4
+SHORT_LAGS = (1, 4)
+ROLLING_WINDOW = 4
 
 
-def colunas_numericas(cfg: PipelineSettings) -> list[str]:
+def numeric_features(cfg: PipelineSettings) -> list[str]:
     """The numeric feature names criar_features() produces for this frequency."""
-    periodos = PERIODOS_POR_ANO.get(cfg.panel_freq.upper()[:1], PERIODOS_POR_ANO_PADRAO)
-    fixas = ["tendencia", "semana_do_ano", "mes", "sazonal_sen", "sazonal_cos",
+    periods = PERIODS_PER_YEAR.get(cfg.panel_freq.upper()[:1], PERIODS_PER_YEAR_DEFAULT)
+    fixed = ["tendencia", "semana_do_ano", "mes", "sazonal_sen", "sazonal_cos",
              "qtd_total", "qtd_mediana", "preco_unitario_mediano",
              "n_fornecedores", "n_orgaos", "taxa_desconto",
              "valor_media_4", "itens_media_4"]
-    defasadas = [f"{alvo}_lag_{d}"
-                 for d in DEFASAGENS_CURTAS + (periodos,)
-                 for alvo in ("valor", "itens")]
-    return fixas + defasadas
+    lagged = [f"{target}_lag_{d}"
+                 for d in SHORT_LAGS + (periods,)
+                 for target in ("valor", "itens")]
+    return fixed + lagged
 
 
-def criar_features(painel: pd.DataFrame, cfg: PipelineSettings) -> pd.DataFrame:
+def build_features(panel: pd.DataFrame, cfg: PipelineSettings) -> pd.DataFrame:
     """Adds calendar, trend, lag, and rolling-mean columns to the panel."""
-    saida = painel.sort_values(CHAVE_COMBO + ["semana"]).copy()
+    out = panel.sort_values(COMBO_KEY + ["semana"]).copy()
 
     # Calendar. The week number carries seasonality a linear model can use only
     # as a cycle, so it also goes in as sine and cosine — week 52 and week 1 are
     # neighbours, which a raw integer cannot express.
-    tempo = saida["semana"].dt.to_timestamp()
-    saida["semana_do_ano"] = tempo.dt.isocalendar().week.astype(int)
-    saida["mes"] = tempo.dt.month
+    stamp = out["semana"].dt.to_timestamp()
+    out["semana_do_ano"] = stamp.dt.isocalendar().week.astype(int)
+    out["mes"] = stamp.dt.month
 
     # The cycle length comes from the configured frequency, so the sine and
     # cosine describe one real year whatever the panel's grain.
-    frequencia = cfg.panel_freq.upper()[:1]
-    periodos = PERIODOS_POR_ANO.get(frequencia)
-    if periodos is None:
+    frequency = cfg.panel_freq.upper()[:1]
+    periods = PERIODS_PER_YEAR.get(frequency)
+    if periods is None:
         print(f"Aviso: PANEL_FREQ={cfg.panel_freq!r} não está no mapa de períodos; "
-              f"assumindo {PERIODOS_POR_ANO_PADRAO} períodos por ano.")
-        periodos = PERIODOS_POR_ANO_PADRAO
+              f"assumindo {PERIODS_PER_YEAR_DEFAULT} períodos por ano.")
+        periods = PERIODS_PER_YEAR_DEFAULT
 
-    angulo = 2 * np.pi * saida["semana_do_ano"] / periodos
-    saida["sazonal_sen"] = np.sin(angulo)
-    saida["sazonal_cos"] = np.cos(angulo)
+    angle = 2 * np.pi * out["semana_do_ano"] / periods
+    out["sazonal_sen"] = np.sin(angle)
+    out["sazonal_cos"] = np.cos(angle)
 
     # Trend, as periods since the start of the panel. Zero-based so the
     # intercept of a linear model reads as "the first week".
-    ordinais = saida["semana"].astype("int64")
-    saida["tendencia"] = (ordinais - ordinais.min()).astype(int)
+    ordinais = out["semana"].astype("int64")
+    out["tendencia"] = (ordinais - ordinais.min()).astype(int)
 
     # Lags and rolling means are computed per combination. Grouping is what
     # stops the lag of one class from reaching into another's history — without
     # it, the first week of class B would inherit the last week of class A.
-    grupos = saida.groupby(CHAVE_COMBO, observed=True)
-    for defasagem in DEFASAGENS_CURTAS + (periodos,):
-        saida[f"valor_lag_{defasagem}"] = grupos["valor_total"].shift(defasagem)
-        saida[f"itens_lag_{defasagem}"] = grupos["n_itens"].shift(defasagem)
+    groups = out.groupby(COMBO_KEY, observed=True)
+    for lag in SHORT_LAGS + (periods,):
+        out[f"valor_lag_{lag}"] = groups["valor_total"].shift(lag)
+        out[f"itens_lag_{lag}"] = groups["n_itens"].shift(lag)
 
     # shift(1) before rolling: the mean must not include the week being
     # predicted. Including it would be the leak this whole module avoids.
-    saida["valor_media_4"] = (grupos["valor_total"]
+    out["valor_media_4"] = (groups["valor_total"]
                               .transform(lambda s: s.shift(1)
-                                         .rolling(JANELA_MEDIA).mean()))
-    saida["itens_media_4"] = (grupos["n_itens"]
+                                         .rolling(ROLLING_WINDOW).mean()))
+    out["itens_media_4"] = (groups["n_itens"]
                               .transform(lambda s: s.shift(1)
-                                         .rolling(JANELA_MEDIA).mean()))
+                                         .rolling(ROLLING_WINDOW).mean()))
 
-    vazias = [c for c in saida.columns
-              if c.endswith(f"_{periodos}") and saida[c].isna().all()]
-    if vazias:
-        print(f"Aviso: {', '.join(vazias)} está(ão) inteiramente vazia(s) — o painel "
-              f"tem {saida['semana'].nunique()} semanas, menos que a defasagem de 52. "
+    empty = [c for c in out.columns
+              if c.endswith(f"_{periods}") and out[c].isna().all()]
+    if empty:
+        print(f"Aviso: {', '.join(empty)} está(ão) inteiramente vazia(s) — o painel "
+              f"tem {out['semana'].nunique()} semanas, menos que a defasagem de 52. "
               f"Amplie WINDOW_DAYS no .env para habilitar o horizonte de um ano.")
 
-    return saida.sort_values(["semana"] + CHAVE_COMBO).reset_index(drop=True)
+    return out.sort_values(["semana"] + COMBO_KEY).reset_index(drop=True)
 ```
 
 - [ ] **Step 4: rodar e confirmar que passa**
@@ -1169,7 +1195,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: o painel com features (Task 5)
-- Produces: `dividir(painel: pd.DataFrame, n_splits: int) -> Iterator[tuple[np.ndarray, np.ndarray]]`,
+- Produces: `split_by_week(panel: pd.DataFrame, n_splits: int) -> Iterator[tuple[np.ndarray, np.ndarray]]`,
   rendendo pares de arrays de índices posicionais de linha, compatíveis com
   `cross_val_score(cv=...)` do scikit-learn.
 
@@ -1182,42 +1208,42 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from pipeline.split import dividir
+from pipeline.split import split_by_week
 
 
 @pytest.fixture
-def painel():
-    semanas = pd.period_range("2025-01-06", periods=10, freq="W")
-    linhas = [{"semana": s, "classe": c, "valor_total": 1.0}
-              for s in semanas for c in ("A", "B", "C")]
-    return pd.DataFrame(linhas)
+def panel():
+    weeks = pd.period_range("2025-01-06", periods=10, freq="W")
+    rows = [{"semana": s, "classe": c, "valor_total": 1.0}
+              for s in weeks for c in ("A", "B", "C")]
+    return pd.DataFrame(rows)
 
 
-def test_nenhuma_semana_nos_dois_lados(painel):
-    for treino, teste in dividir(painel, n_splits=3):
-        semanas_treino = set(painel.iloc[treino]["semana"])
-        semanas_teste = set(painel.iloc[teste]["semana"])
+def test_no_week_on_both_sides(panel):
+    for train, test in split_by_week(panel, n_splits=3):
+        semanas_treino = set(panel.iloc[train]["semana"])
+        semanas_teste = set(panel.iloc[test]["semana"])
         assert not (semanas_treino & semanas_teste)
 
 
-def test_treino_e_sempre_o_passado(painel):
-    for treino, teste in dividir(painel, n_splits=3):
-        assert painel.iloc[treino]["semana"].max() < painel.iloc[teste]["semana"].min()
+def test_train_is_always_the_past(panel):
+    for train, test in split_by_week(panel, n_splits=3):
+        assert panel.iloc[train]["semana"].max() < panel.iloc[test]["semana"].min()
 
 
-def test_semana_inteira_de_cada_vez(painel):
+def test_whole_weeks_only(panel):
     """Cada semana traz as três classes juntas: 3 linhas por semana."""
-    for treino, teste in dividir(painel, n_splits=3):
-        assert len(teste) % 3 == 0
+    for train, test in split_by_week(panel, n_splits=3):
+        assert len(test) % 3 == 0
 
 
-def test_numero_de_dobras(painel):
-    assert len(list(dividir(painel, n_splits=3))) == 3
+def test_number_of_folds(panel):
+    assert len(list(split_by_week(panel, n_splits=3))) == 3
 
 
-def test_recusa_dobras_demais(painel):
+def test_rejects_too_many_folds(panel):
     with pytest.raises(ValueError, match="semanas"):
-        list(dividir(painel, n_splits=20))
+        list(split_by_week(panel, n_splits=20))
 ```
 
 - [ ] **Step 2: rodar e confirmar que falha**
@@ -1251,25 +1277,25 @@ import pandas as pd
 from sklearn.model_selection import TimeSeriesSplit
 
 
-def dividir(painel: pd.DataFrame, n_splits: int) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+def split_by_week(panel: pd.DataFrame, n_splits: int) -> Iterator[tuple[np.ndarray, np.ndarray]]:
     """Yields (train, test) positional row indices, cutting only between weeks."""
-    semanas = np.sort(painel["semana"].unique())
-    if len(semanas) < n_splits + 1:
+    weeks = np.sort(panel["semana"].unique())
+    if len(weeks) < n_splits + 1:
         raise ValueError(
             f"{n_splits} dobras exigem pelo menos {n_splits + 1} semanas "
-            f"distintas; o painel tem {len(semanas)}."
+            f"distintas; o painel tem {len(weeks)}."
         )
 
     # Position of each row's week within the sorted week list, so a week-level
     # decision becomes a row-level mask without a join.
-    posicao = pd.Series(painel["semana"]).map(
-        {semana: i for i, semana in enumerate(semanas)}
+    position = pd.Series(panel["semana"]).map(
+        {semana: i for i, semana in enumerate(weeks)}
     ).to_numpy()
 
-    for treino_sem, teste_sem in TimeSeriesSplit(n_splits=n_splits).split(semanas):
-        treino = np.flatnonzero(np.isin(posicao, treino_sem))
-        teste = np.flatnonzero(np.isin(posicao, teste_sem))
-        yield treino, teste
+    for train_weeks, test_weeks in TimeSeriesSplit(n_splits=n_splits).split(weeks):
+        train = np.flatnonzero(np.isin(position, train_weeks))
+        test = np.flatnonzero(np.isin(position, test_weeks))
+        yield train, test
 ```
 
 - [ ] **Step 4: rodar e confirmar que passa**
@@ -1295,8 +1321,8 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Test: `tests/pipeline/test_transform.py`
 
 **Interfaces:**
-- Consumes: `COLUNAS_CATEGORICAS` e `colunas_numericas(cfg)` (Task 5)
-- Produces: `montar_transformador(cfg: PipelineSettings) -> ColumnTransformer`,
+- Consumes: `CATEGORICAL_FEATURES` e `numeric_features(cfg)` (Task 5)
+- Produces: `build_transformer(cfg: PipelineSettings) -> ColumnTransformer`,
   **não ajustado**, para ser embutido num `sklearn.pipeline.Pipeline`.
 
 - [ ] **Step 1: escrever o teste que falha**
@@ -1311,8 +1337,8 @@ from sklearn.linear_model import Ridge
 from sklearn.pipeline import Pipeline
 
 from classes.pipeline_settings import PipelineSettings
-from pipeline.features import COLUNAS_CATEGORICAS, colunas_numericas
-from pipeline.transform import montar_transformador
+from pipeline.features import CATEGORICAL_FEATURES, numeric_features
+from pipeline.transform import build_transformer
 
 
 @pytest.fixture
@@ -1325,49 +1351,49 @@ def cfg(tmp_path):
 @pytest.fixture
 def X(cfg):
     n = 20
-    dados = {c: np.arange(n, dtype=float) for c in colunas_numericas(cfg)}
-    dados["materialOuServicoNome"] = ["Material", "Serviço"] * (n // 2)
-    dados["classe"] = ["A", "B", "C", "D"] * (n // 4)
-    return pd.DataFrame(dados)
+    data = {c: np.arange(n, dtype=float) for c in numeric_features(cfg)}
+    data["materialOuServicoNome"] = ["Material", "Serviço"] * (n // 2)
+    data["classe"] = ["A", "B", "C", "D"] * (n // 4)
+    return pd.DataFrame(data)
 
 
-def test_categoricas_viram_colunas_binarias(cfg, X):
-    saida = montar_transformador(cfg).fit_transform(X)
+def test_categoricals_become_binary_columns(cfg, X):
+    out = build_transformer(cfg).fit_transform(X)
     # 2 valores de material/serviço + 4 classes + as numéricas
-    assert saida.shape[1] == 2 + 4 + len(colunas_numericas(cfg))
+    assert out.shape[1] == 2 + 4 + len(numeric_features(cfg))
 
 
-def test_categoria_nova_no_teste_nao_quebra(cfg, X):
-    transformador = montar_transformador(cfg).fit(X)
+def test_unseen_category_does_not_break(cfg, X):
+    transformador = build_transformer(cfg).fit(X)
     novo = X.head(1).copy()
     novo.loc[:, "classe"] = "Z"          # classe nunca vista no treino
     assert transformador.transform(novo).shape[1] == transformador.transform(X).shape[1]
 
 
-def test_scaler_ajustado_so_no_treino(cfg, X):
+def test_scaler_is_fitted_on_train_only(cfg, X):
     """O teste de vazamento: a média do scaler é a do treino, não a do todo."""
-    treino, teste = X.iloc[:10], X.iloc[10:]
-    modelo = Pipeline([("prep", montar_transformador(cfg)), ("reg", Ridge())])
-    modelo.fit(treino, np.arange(10, dtype=float))
+    train, test = X.iloc[:10], X.iloc[10:]
+    modelo = Pipeline([("prep", build_transformer(cfg)), ("reg", Ridge())])
+    modelo.fit(train, np.arange(10, dtype=float))
 
     # named_transformers_["num"] é o Pipeline (imputa + escala); o scaler
     # está dentro dele.
     scaler = (modelo.named_steps["prep"]
               .named_transformers_["num"].named_steps["escala"])
-    esperado = treino["tendencia"].mean()
+    expected = train["tendencia"].mean()
     # O índice vem da mesma lista que o transformador recebeu, não de uma
     # constante paralela que poderia estar em outra ordem.
-    indice = colunas_numericas(cfg).index("tendencia")
-    assert scaler.mean_[indice] == pytest.approx(esperado)
+    indice = numeric_features(cfg).index("tendencia")
+    assert scaler.mean_[indice] == pytest.approx(expected)
     assert scaler.mean_[indice] != pytest.approx(X["tendencia"].mean())
 
 
-def test_nan_nas_features_nao_quebra(cfg, X):
+def test_nan_features_do_not_break(cfg, X):
     """Os lags nascem com NaN nas primeiras semanas; o transformador aguenta."""
     X = X.copy()
     X.loc[0:3, "valor_lag_52"] = np.nan
-    saida = montar_transformador(cfg).fit_transform(X)
-    assert not np.isnan(saida).any()
+    out = build_transformer(cfg).fit_transform(X)
+    assert not np.isnan(out).any()
 ```
 
 - [ ] **Step 2: rodar e confirmar que falha**
@@ -1401,15 +1427,15 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from classes.pipeline_settings import PipelineSettings
-from pipeline.features import COLUNAS_CATEGORICAS, colunas_numericas
+from pipeline.features import CATEGORICAL_FEATURES, numeric_features
 
 
-def montar_transformador(cfg: PipelineSettings) -> ColumnTransformer:
+def build_transformer(cfg: PipelineSettings) -> ColumnTransformer:
     """Builds the unfitted ColumnTransformer for the panel's feature columns."""
     # Lags are NaN for the first weeks of every combination, by construction.
     # Imputing the median keeps those rows usable; dropping them would throw
     # away the start of every series.
-    numericas = Pipeline([
+    numeric_pipe = Pipeline([
         ("imputa", SimpleImputer(strategy="median")),
         # Scaling matters for Ridge, which compares magnitudes, and is
         # harmless for the tree models. Keeping it makes swapping the
@@ -1417,7 +1443,7 @@ def montar_transformador(cfg: PipelineSettings) -> ColumnTransformer:
         ("escala", StandardScaler()),
     ])
 
-    categoricas = OneHotEncoder(
+    categorical_pipe = OneHotEncoder(
         # A class present only in the test fold must not raise: with a temporal
         # split, a class that appears late in the year is exactly that.
         handle_unknown="ignore",
@@ -1428,8 +1454,8 @@ def montar_transformador(cfg: PipelineSettings) -> ColumnTransformer:
         [
             # Asked of features.py rather than hardcoded, so the annual lag's
             # name follows PANEL_FREQ and the two modules cannot drift apart.
-            ("num", numericas, colunas_numericas(cfg)),
-            ("cat", categoricas, COLUNAS_CATEGORICAS),
+            ("num", numeric_pipe, numeric_features(cfg)),
+            ("cat", categorical_pipe, CATEGORICAL_FEATURES),
         ],
         # Anything not named is dropped: the targets and the key columns must
         # never reach the model as features.
@@ -1462,8 +1488,8 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: os itens brutos (Task 2), os limpos e a quarentena (Task 3), o
   painel (Task 4)
-- Produces: `gerar_graficos(bruto: pd.DataFrame, limpo: pd.DataFrame, painel: pd.DataFrame, destino: Path, quarentena: pd.DataFrame | None = None) -> list[Path]`,
-  devolvendo os caminhos dos PNG escritos. O parâmetro `quarentena` alimenta a
+- Produces: `make_figures(raw_items: pd.DataFrame, kept_items: pd.DataFrame, panel: pd.DataFrame, destination: Path, quarantined: pd.DataFrame | None = None) -> list[Path]`,
+  devolvendo os caminhos dos PNG escritos. O parâmetro `quarantined` alimenta a
   quarta figura; sem ele, ela sai com a mensagem "Nenhum item em quarentena".
 
 **Design dos gráficos** (a paleta foi validada pelas seis checagens da skill
@@ -1472,10 +1498,10 @@ não substituir sem revalidar com `scripts/validate_palette.js`):
 
 | arquivo | forma | por quê |
 |---|---|---|
-| `01-serie-bruto-vs-limpo.png` | duas linhas | mudança no tempo, duas séries: legenda presente e rótulo direto no fim de cada linha |
+| `01-series-raw_items-vs-kept_items.png` | duas linhas | mudança no tempo, duas séries: legenda presente e rótulo direto no fim de cada linha |
 | `02-distribuicao-log.png` | histograma, x em log | uma série, sem legenda: o título nomeia o que é |
 | `03-composicao-material-servico.png` | barras empilhadas por semana | composição ao longo do tempo, duas categorias |
-| `04-quarentena.png` | barras horizontais | magnitude por motivo, com rótulo direto no valor |
+| `04-quarantined.png` | barras horizontais | magnitude por motivo, com rótulo direto no valor |
 
 - [ ] **Step 1: escrever o teste que falha**
 
@@ -1488,42 +1514,42 @@ matplotlib.use("Agg")           # sem display, antes de qualquer import de pyplo
 import pandas as pd
 import pytest
 
-from pipeline.plots import gerar_graficos
+from pipeline.plots import make_figures
 
 
 @pytest.fixture
-def dados():
-    semanas = pd.period_range("2025-01-06", periods=6, freq="W")
+def data():
+    weeks = pd.period_range("2025-01-06", periods=6, freq="W")
     itens = pd.DataFrame({
         "dataInclusaoPncp": pd.to_datetime(
             ["2025-01-08", "2025-01-15", "2025-01-22"] * 2),
         "valorTotalResultado": [100.0, 200.0, 300.0, 1e10, 150.0, 250.0],
         "materialOuServicoNome": ["Material", "Serviço"] * 3,
     })
-    limpo = itens.drop(index=3)
-    painel = pd.DataFrame([
+    kept_items = itens.drop(index=3)
+    panel = pd.DataFrame([
         {"semana": s, "materialOuServicoNome": m, "classe": "A",
          "valor_total": 100.0 * (i + 1), "n_itens": i + 1}
-        for i, s in enumerate(semanas) for m in ("Material", "Serviço")])
-    return itens, limpo, painel
+        for i, s in enumerate(weeks) for m in ("Material", "Serviço")])
+    return itens, kept_items, panel
 
 
-def test_gera_os_quatro_png(dados, tmp_path):
-    itens, limpo, painel = dados
-    quarentena = itens.loc[[3]].assign(motivo="quantidade implausível na classe")
-    caminhos = gerar_graficos(itens, limpo, painel, tmp_path,
-                              quarentena=quarentena)
-    assert len(caminhos) == 4
-    for caminho in caminhos:
-        assert caminho.exists() and caminho.stat().st_size > 0
-        assert caminho.suffix == ".png"
+def test_writes_the_four_pngs(data, tmp_path):
+    itens, kept_items, panel = data
+    quarantined = itens.loc[[3]].assign(motivo="quantidade implausível na classe")
+    paths = make_figures(itens, kept_items, panel, tmp_path,
+                              quarantined=quarantined)
+    assert len(paths) == 4
+    for path in paths:
+        assert path.exists() and path.stat().st_size > 0
+        assert path.suffix == ".png"
 
 
-def test_quarentena_vazia_nao_quebra(dados, tmp_path):
-    itens, limpo, painel = dados
+def test_empty_quarantine_does_not_break(data, tmp_path):
+    itens, kept_items, panel = data
     vazia = itens.head(0).assign(motivo=pd.Series(dtype="object"))
-    caminhos = gerar_graficos(itens, limpo, painel, tmp_path, quarentena=vazia)
-    assert len(caminhos) == 4
+    paths = make_figures(itens, kept_items, panel, tmp_path, quarantined=vazia)
+    assert len(paths) == 4
 ```
 
 - [ ] **Step 2: rodar e confirmar que falha**
@@ -1561,141 +1587,141 @@ import numpy as np
 import pandas as pd
 
 # Categorical slots 1 and 2. Identity, not magnitude, so two distinct hues.
-SERIE_1 = "#2a78d6"
-SERIE_2 = "#eb6834"
+SERIES_1 = "#2a78d6"
+SERIES_2 = "#eb6834"
 # Text wears text tokens, never the series colour.
-TINTA = "#0b0b0b"
-TINTA_FRACA = "#52514e"
-SUPERFICIE = "#fcfcfb"
-GRADE = "#e3e2de"
+INK = "#0b0b0b"
+INK_MUTED = "#52514e"
+SURFACE = "#fcfcfb"
+GRID = "#e3e2de"
 
 
-def _figura(titulo: str, subtitulo: str = "") -> tuple[plt.Figure, plt.Axes]:
+def _new_figure(titulo: str, subtitulo: str = "") -> tuple[plt.Figure, plt.Axes]:
     """One figure, styled once: recessive axes, no top/right spines."""
-    fig, ax = plt.subplots(figsize=(10, 5), facecolor=SUPERFICIE)
-    ax.set_facecolor(SUPERFICIE)
-    ax.set_title(titulo, color=TINTA, fontsize=13, loc="left", pad=16 if subtitulo else 8)
+    fig, ax = plt.subplots(figsize=(10, 5), facecolor=SURFACE)
+    ax.set_facecolor(SURFACE)
+    ax.set_title(titulo, color=INK, fontsize=13, loc="left", pad=16 if subtitulo else 8)
     if subtitulo:
         ax.text(0, 1.02, subtitulo, transform=ax.transAxes,
-                color=TINTA_FRACA, fontsize=10, va="bottom")
+                color=INK_MUTED, fontsize=10, va="bottom")
     # Recessive grid and axes: the data carries the ink.
-    ax.grid(axis="y", color=GRADE, linewidth=0.8)
+    ax.grid(axis="y", color=GRID, linewidth=0.8)
     ax.set_axisbelow(True)
     for lado in ("top", "right"):
         ax.spines[lado].set_visible(False)
     for lado in ("left", "bottom"):
-        ax.spines[lado].set_color(GRADE)
-    ax.tick_params(colors=TINTA_FRACA, labelsize=9)
+        ax.spines[lado].set_color(GRID)
+    ax.tick_params(colors=INK_MUTED, labelsize=9)
     return fig, ax
 
 
-def _salvar(fig: plt.Figure, caminho: Path) -> Path:
-    caminho.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(caminho, dpi=150, bbox_inches="tight", facecolor=SUPERFICIE)
+def _save(fig: plt.Figure, path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=150, bbox_inches="tight", facecolor=SURFACE)
     plt.close(fig)
-    return caminho
+    return path
 
 
-def _serie_semanal(itens: pd.DataFrame) -> pd.Series:
+def _weekly_series(itens: pd.DataFrame) -> pd.Series:
     return (itens.set_index("dataInclusaoPncp")["valorTotalResultado"]
             .resample("W").sum())
 
 
-def gerar_graficos(bruto: pd.DataFrame, limpo: pd.DataFrame, painel: pd.DataFrame,
-                   destino: Path, quarentena: pd.DataFrame | None = None) -> list[Path]:
+def make_figures(raw_items: pd.DataFrame, kept_items: pd.DataFrame, panel: pd.DataFrame,
+                   destination: Path, quarantined: pd.DataFrame | None = None) -> list[Path]:
     """Writes the four figures and returns their paths."""
-    destino = Path(destino)
-    caminhos: list[Path] = []
+    destination = Path(destination)
+    paths: list[Path] = []
 
     # --- 1. the series, before and after cleaning -------------------------
-    antes, depois = _serie_semanal(bruto), _serie_semanal(limpo)
-    fig, ax = _figura("Gasto homologado por semana",
+    before, after = _weekly_series(raw_items), _weekly_series(kept_items)
+    fig, ax = _new_figure("Gasto homologado por semana",
                       "Antes e depois do filtro de plausibilidade")
     # 2px lines, per the mark spec.
-    ax.plot(antes.index, antes.to_numpy() / 1e9, color=SERIE_1, linewidth=2,
+    ax.plot(before.index, before.to_numpy() / 1e9, color=SERIES_1, linewidth=2,
             label="Bruto")
-    ax.plot(depois.index, depois.to_numpy() / 1e9, color=SERIE_2, linewidth=2,
+    ax.plot(after.index, after.to_numpy() / 1e9, color=SERIES_2, linewidth=2,
             label="Limpo")
     # Two series: legend always, and direct labels because there are <= 4.
-    for serie, cor, rotulo in ((antes, SERIE_1, "Bruto"), (depois, SERIE_2, "Limpo")):
-        if len(serie):
-            ax.annotate(rotulo, (serie.index[-1], serie.iloc[-1] / 1e9),
+    for series, color, label in ((before, SERIES_1, "Bruto"), (after, SERIES_2, "Limpo")):
+        if len(series):
+            ax.annotate(label, (series.index[-1], series.iloc[-1] / 1e9),
                         xytext=(6, 0), textcoords="offset points",
-                        color=cor, fontsize=9, va="center")
-    ax.set_ylabel("R$ bilhões", color=TINTA_FRACA, fontsize=10)
-    ax.legend(frameon=False, labelcolor=TINTA_FRACA, fontsize=9)
-    caminhos.append(_salvar(fig, destino / "01-serie-bruto-vs-limpo.png"))
+                        color=color, fontsize=9, va="center")
+    ax.set_ylabel("R$ bilhões", color=INK_MUTED, fontsize=10)
+    ax.legend(frameon=False, labelcolor=INK_MUTED, fontsize=9)
+    paths.append(_save(fig, destination / "01-serie-bruto-vs-limpo.png"))
 
     # --- 2. the distribution, on a log axis -------------------------------
-    valores = limpo["valorTotalResultado"].dropna()
-    valores = valores[valores > 0]
-    fig, ax = _figura("Distribuição do valor por item",
+    values = kept_items["valorTotalResultado"].dropna()
+    values = values[values > 0]
+    fig, ax = _new_figure("Distribuição do valor por item",
                       "Escala logarítmica: a mediana e a média diferem em 271x")
-    if len(valores):
+    if len(values):
         # One series: no legend box, the title names it.
-        ax.hist(valores, bins=np.logspace(np.log10(valores.min()),
-                                          np.log10(valores.max()), 50),
-                color=SERIE_1)
+        ax.hist(values, bins=np.logspace(np.log10(values.min()),
+                                          np.log10(values.max()), 50),
+                color=SERIES_1)
         ax.set_xscale("log")
-        ax.axvline(valores.median(), color=TINTA_FRACA, linewidth=1.5,
+        ax.axvline(values.median(), color=INK_MUTED, linewidth=1.5,
                    linestyle="--")
-        ax.annotate(f"mediana R$ {valores.median():,.0f}",
-                    (valores.median(), ax.get_ylim()[1] * 0.9),
+        ax.annotate(f"mediana R$ {values.median():,.0f}",
+                    (values.median(), ax.get_ylim()[1] * 0.9),
                     xytext=(8, 0), textcoords="offset points",
-                    color=TINTA_FRACA, fontsize=9)
-    ax.set_xlabel("R$ por item (log)", color=TINTA_FRACA, fontsize=10)
-    ax.set_ylabel("itens", color=TINTA_FRACA, fontsize=10)
-    caminhos.append(_salvar(fig, destino / "02-distribuicao-log.png"))
+                    color=INK_MUTED, fontsize=9)
+    ax.set_xlabel("R$ por item (log)", color=INK_MUTED, fontsize=10)
+    ax.set_ylabel("itens", color=INK_MUTED, fontsize=10)
+    paths.append(_save(fig, destination / "02-distribuicao-log.png"))
 
     # --- 3. composition over time -----------------------------------------
-    comp = (painel.groupby(["semana", "materialOuServicoNome"], observed=True)
+    composition = (panel.groupby(["semana", "materialOuServicoNome"], observed=True)
             ["valor_total"].sum().unstack(fill_value=0))
-    fig, ax = _figura("Composição do gasto por semana",
+    fig, ax = _new_figure("Composição do gasto por semana",
                       "Material e serviço, sobre os dados limpos")
-    if not comp.empty:
-        base = np.zeros(len(comp))
-        for coluna, cor in zip(comp.columns, (SERIE_1, SERIE_2)):
-            altura = comp[coluna].to_numpy() / 1e9
+    if not composition.empty:
+        base = np.zeros(len(composition))
+        for column, color in zip(composition.columns, (SERIES_1, SERIES_2)):
+            height = composition[column].to_numpy() / 1e9
             # A 2px surface gap between stacked segments keeps the boundary
             # readable without a border colour.
-            ax.bar(range(len(comp)), altura, bottom=base, color=cor,
-                   label=str(coluna), width=0.82, linewidth=2,
-                   edgecolor=SUPERFICIE)
-            base = base + altura
-        passo = max(1, len(comp) // 12)
-        ax.set_xticks(range(0, len(comp), passo))
-        ax.set_xticklabels([str(s) for s in comp.index[::passo]], rotation=45,
+            ax.bar(range(len(composition)), height, bottom=base, color=color,
+                   label=str(column), width=0.82, linewidth=2,
+                   edgecolor=SURFACE)
+            base = base + height
+        step = max(1, len(composition) // 12)
+        ax.set_xticks(range(0, len(composition), step))
+        ax.set_xticklabels([str(s) for s in composition.index[::step]], rotation=45,
                            ha="right")
-        ax.legend(frameon=False, labelcolor=TINTA_FRACA, fontsize=9)
-    ax.set_ylabel("R$ bilhões", color=TINTA_FRACA, fontsize=10)
-    caminhos.append(_salvar(fig, destino / "03-composicao-material-servico.png"))
+        ax.legend(frameon=False, labelcolor=INK_MUTED, fontsize=9)
+    ax.set_ylabel("R$ bilhões", color=INK_MUTED, fontsize=10)
+    paths.append(_save(fig, destination / "03-composicao-material-servico.png"))
 
     # --- 4. what the cleaning removed -------------------------------------
-    fig, ax = _figura("O que a limpeza removeu",
+    fig, ax = _new_figure("O que a limpeza removeu",
                       "Valor em quarentena, por motivo")
-    if quarentena is not None and len(quarentena):
-        por_motivo = (quarentena.groupby("motivo")["valorTotalResultado"]
+    if quarantined is not None and len(quarantined):
+        by_reason = (quarantined.groupby("motivo")["valorTotalResultado"]
                       .agg(["sum", "size"]).sort_values("sum"))
-        posicoes = range(len(por_motivo))
-        ax.barh(posicoes, por_motivo["sum"] / 1e9, color=SERIE_2, height=0.6)
-        ax.set_yticks(posicoes)
-        ax.set_yticklabels(por_motivo.index, fontsize=9)
+        positions = range(len(by_reason))
+        ax.barh(positions, by_reason["sum"] / 1e9, color=SERIES_2, height=0.6)
+        ax.set_yticks(positions)
+        ax.set_yticklabels(by_reason.index, fontsize=9)
         # Direct labels on the bars: the magnitude is the message.
-        for i, (valor, n) in enumerate(zip(por_motivo["sum"], por_motivo["size"])):
-            ax.annotate(f"R$ {valor / 1e9:,.1f} bi · {n:,} itens",
-                        (valor / 1e9, i), xytext=(6, 0),
-                        textcoords="offset points", color=TINTA_FRACA,
+        for i, (value, n) in enumerate(zip(by_reason["sum"], by_reason["size"])):
+            ax.annotate(f"R$ {value / 1e9:,.1f} bi · {n:,} itens",
+                        (value / 1e9, i), xytext=(6, 0),
+                        textcoords="offset points", color=INK_MUTED,
                         fontsize=9, va="center")
         ax.grid(axis="y", visible=False)
-        ax.grid(axis="x", color=GRADE, linewidth=0.8)
+        ax.grid(axis="x", color=GRID, linewidth=0.8)
     else:
         ax.text(0.5, 0.5, "Nenhum item em quarentena", transform=ax.transAxes,
-                ha="center", color=TINTA_FRACA, fontsize=11)
+                ha="center", color=INK_MUTED, fontsize=11)
         ax.set_axis_off()
-    ax.set_xlabel("R$ bilhões", color=TINTA_FRACA, fontsize=10)
-    caminhos.append(_salvar(fig, destino / "04-quarentena.png"))
+    ax.set_xlabel("R$ bilhões", color=INK_MUTED, fontsize=10)
+    paths.append(_save(fig, destination / "04-quarentena.png"))
 
-    return caminhos
+    return paths
 ```
 
 - [ ] **Step 4: rodar e confirmar que passa**
@@ -1750,7 +1776,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: todos os módulos das Tasks 2 a 8
 - Produces: `main(argv: list[str] | None = None) -> int`, com os códigos de
   saída `0`, `1` e `130`. Escreve `data/interim/itens_limpos.parquet`,
-  `data/interim/quarentena.parquet`, `data/processed/painel.parquet`,
+  `data/interim/quarantined.parquet`, `data/processed/panel.parquet`,
   `data/processed/painel_features.parquet` e os PNG em `reports/figures/`.
 
 - [ ] **Step 1: escrever o teste que falha**
@@ -1766,56 +1792,56 @@ import pytest
 
 import prepare
 
-CABECALHO = ("idCompraItem,dataInclusaoPncp,codigoClasse,materialOuServicoNome,"
+HEADER = ("idCompraItem,dataInclusaoPncp,codigoClasse,materialOuServicoNome,"
              "situacaoCompraItemNome,itemCategoriaNome,temResultado,codigoGrupo,"
              "quantidade,valorUnitarioEstimado,valorTotal,valorTotalResultado,"
              "nomeFornecedor,orgaoEntidadeCnpj\n")
 
 
-def _linha(i, dia, qtd=10.0):
+def _row(i, dia, qtd=10.0):
     return (f"id{i},2025-01-{dia:02d}T10:00:00,7010,Material,Homologado,"
             f"Informática (TIC),True,,{qtd},100.0,1000.0,900.0,forn{i},org1\n")
 
 
 @pytest.fixture
-def ambiente(tmp_path, monkeypatch):
+def environment(tmp_path, monkeypatch):
     raw = tmp_path / "raw"
     raw.mkdir()
-    linhas = "".join(_linha(i, 2 + (i % 20)) for i in range(60))
-    (raw / "contract_items.csv").write_text(CABECALHO + linhas, encoding="utf-8-sig")
+    rows = "".join(_row(i, 2 + (i % 20)) for i in range(60))
+    (raw / "contract_items.csv").write_text(HEADER + rows, encoding="utf-8-sig")
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("FIGURES_DIR", str(tmp_path / "fig"))
     monkeypatch.setenv("TOP_CLASSES", "5")
     return tmp_path
 
 
-def test_execucao_completa_grava_os_artefatos(ambiente):
+def test_full_run_writes_the_artefacts(environment):
     assert prepare.main([]) == 0
-    assert (ambiente / "interim" / "itens_limpos.parquet").exists()
-    assert (ambiente / "interim" / "quarentena.parquet").exists()
-    assert (ambiente / "processed" / "painel.parquet").exists()
-    assert (ambiente / "processed" / "painel_features.parquet").exists()
-    assert list((ambiente / "fig").glob("*.png"))
+    assert (environment / "interim" / "itens_limpos.parquet").exists()
+    assert (environment / "interim" / "quarentena.parquet").exists()
+    assert (environment / "processed" / "painel.parquet").exists()
+    assert (environment / "processed" / "painel_features.parquet").exists()
+    assert list((environment / "fig").glob("*.png"))
 
 
-def test_parada_em_estagio(ambiente):
+def test_stops_at_a_stage(environment):
     assert prepare.main(["--ate", "clean"]) == 0
-    assert (ambiente / "interim" / "itens_limpos.parquet").exists()
-    assert not (ambiente / "processed" / "painel.parquet").exists()
+    assert (environment / "interim" / "itens_limpos.parquet").exists()
+    assert not (environment / "processed" / "painel.parquet").exists()
 
 
-def test_csv_ausente_devolve_1(tmp_path, monkeypatch, capsys):
+def test_missing_csv_returns_1(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     assert prepare.main([]) == 1
     assert "src/main.py" in capsys.readouterr().out
 
 
-def test_soma_do_painel_bate_com_os_itens_limpos(ambiente):
+def test_panel_sum_matches_the_kept_items(environment):
     prepare.main([])
-    limpos = pd.read_parquet(ambiente / "interim" / "itens_limpos.parquet")
-    painel = pd.read_parquet(ambiente / "processed" / "painel.parquet")
-    assert painel["valor_total"].sum() == pytest.approx(
-        limpos["valorTotalResultado"].sum())
+    kept = pd.read_parquet(environment / "interim" / "itens_limpos.parquet")
+    panel = pd.read_parquet(environment / "processed" / "painel.parquet")
+    assert panel["valor_total"].sum() == pytest.approx(
+        kept["valorTotalResultado"].sum())
 ```
 
 - [ ] **Step 2: rodar e confirmar que falha**
@@ -1854,114 +1880,114 @@ from pathlib import Path
 import pandas as pd
 
 from classes.pipeline_settings import PipelineSettings
-from pipeline.aggregate import para_painel
-from pipeline.clean import limpar
-from pipeline.features import criar_features
-from pipeline.load import carregar
-from pipeline.plots import gerar_graficos
+from pipeline.aggregate import to_panel
+from pipeline.clean import clean
+from pipeline.features import build_features
+from pipeline.load import load_raw
+from pipeline.plots import make_figures
 from read_type_methods import ConfigError
 
-ESTAGIOS = ["load", "clean", "aggregate", "features", "plots"]
+STAGES = ["load", "clean", "aggregate", "features", "plots"]
 
 EXIT_OK = 0
-EXIT_ERRO = 1
+EXIT_ERROR = 1
 # 130 is the conventional shell code for "terminated by SIGINT" (Ctrl+C).
-EXIT_INTERROMPIDO = 130
+EXIT_INTERRUPTED = 130
 
 
-def _gravar(df: pd.DataFrame, caminho: Path) -> None:
+def _write(df: pd.DataFrame, path: Path) -> None:
     """Writes Parquet, falling back to CSV when pyarrow is absent."""
-    caminho.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        df.to_parquet(caminho, index=False)
+        df.to_parquet(path, index=False)
     except ImportError:
-        alternativa = caminho.with_suffix(".csv")
-        print(f"Aviso: pyarrow não está instalado; gravando {alternativa.name} "
+        fallback = path.with_suffix(".csv")
+        print(f"Aviso: pyarrow não está instalado; gravando {fallback.name} "
               f"em vez de Parquet (arquivo maior e sem tipos preservados).")
-        df.to_csv(alternativa, index=False, encoding="utf-8-sig")
+        df.to_csv(fallback, index=False, encoding="utf-8-sig")
 
 
-def executar(cfg: PipelineSettings, ate: str) -> int:
+def run_stages(cfg: PipelineSettings, ate: str) -> int:
     """Runs the stages up to and including `ate`. Returns rows in the panel."""
-    limite = ESTAGIOS.index(ate)
+    limit = STAGES.index(ate)
 
     print("Lendo", cfg.raw_csv, flush=True)
-    bruto = carregar(cfg.raw_csv, cfg)
-    if limite == 0:
-        return len(bruto)
+    raw_items = load_raw(cfg.raw_csv, cfg)
+    if limit == 0:
+        return len(raw_items)
 
-    limpo, quarentena = limpar(bruto, cfg)
+    kept_items, quarantined = clean(raw_items, cfg)
     # The invariant that would have caught the duplicate rows the day they
     # appeared: cleaning splits the frame, it never shrinks the total.
-    assert len(limpo) + len(quarentena) == len(bruto), (
-        f"limpeza perdeu linhas: {len(bruto)} entraram, "
-        f"{len(limpo) + len(quarentena)} saíram"
+    assert len(kept_items) + len(quarantined) == len(raw_items), (
+        f"limpeza perdeu linhas: {len(raw_items)} entraram, "
+        f"{len(kept_items) + len(quarantined)} saíram"
     )
-    _gravar(limpo, cfg.interim_dir / "itens_limpos.parquet")
-    _gravar(quarentena, cfg.interim_dir / "quarentena.parquet")
-    if limite == 1:
-        return len(limpo)
+    _write(kept_items, cfg.interim_dir / "itens_limpos.parquet")
+    _write(quarantined, cfg.interim_dir / "quarentena.parquet")
+    if limit == 1:
+        return len(kept_items)
 
-    painel = para_painel(limpo, cfg)
-    n_semanas = painel["semana"].nunique()
-    n_combos = painel[["materialOuServicoNome", "classe"]].drop_duplicates().shape[0]
-    assert len(painel) == n_semanas * n_combos, (
-        f"painel não é retângulo: {len(painel)} linhas para "
-        f"{n_semanas} semanas x {n_combos} combinações"
+    panel = to_panel(kept_items, cfg)
+    n_weeks = panel["semana"].nunique()
+    n_combos = panel[["materialOuServicoNome", "classe"]].drop_duplicates().shape[0]
+    assert len(panel) == n_weeks * n_combos, (
+        f"painel não é retângulo: {len(panel)} linhas para "
+        f"{n_weeks} semanas x {n_combos} combinações"
     )
-    esperado = limpo["valorTotalResultado"].sum()
-    assert abs(painel["valor_total"].sum() - esperado) < 1e-6 * max(1.0, abs(esperado)), (
+    expected = kept_items["valorTotalResultado"].sum()
+    assert abs(panel["valor_total"].sum() - expected) < 1e-6 * max(1.0, abs(expected)), (
         "a agregação não preservou a soma dos valores"
     )
-    _gravar(painel, cfg.processed_dir / "painel.parquet")
-    print(f"Painel: {len(painel):,} linhas ({n_semanas} semanas x {n_combos} combinações)")
-    if limite == 2:
-        return len(painel)
+    _write(panel, cfg.processed_dir / "painel.parquet")
+    print(f"Painel: {len(panel):,} linhas ({n_weeks} semanas x {n_combos} combinações)")
+    if limit == 2:
+        return len(panel)
 
-    com_features = criar_features(painel, cfg)
-    _gravar(com_features, cfg.processed_dir / "painel_features.parquet")
-    if limite == 3:
-        return len(com_features)
+    featured = build_features(panel, cfg)
+    _write(featured, cfg.processed_dir / "painel_features.parquet")
+    if limit == 3:
+        return len(featured)
 
-    figuras = gerar_graficos(bruto, limpo, painel, cfg.figures_dir,
-                             quarentena=quarentena)
-    print(f"{len(figuras)} figura(s) em {cfg.figures_dir}")
-    return len(com_features)
+    figures = make_figures(raw_items, kept_items, panel, cfg.figures_dir,
+                             quarantined=quarantined)
+    print(f"{len(figures)} figura(s) em {cfg.figures_dir}")
+    return len(featured)
 
 
 def main(argv: list[str] | None = None) -> int:
     """Entry point. Returns the process exit code rather than exiting itself."""
     parser = argparse.ArgumentParser(
         description="Prepara o painel semanal a partir do CSV bruto do coletor.")
-    parser.add_argument("--ate", choices=ESTAGIOS, default=ESTAGIOS[-1],
+    parser.add_argument("--ate", choices=STAGES, default=STAGES[-1],
                         help="roda até este estágio, inclusive")
     args = parser.parse_args(argv)
 
     try:
         cfg = PipelineSettings.from_env()
-    except ConfigError as erro:
+    except ConfigError as error:
         # A configuration mistake is the user's to fix, so it is reported as a
         # plain message instead of a traceback.
-        print(f"Erro de configuração no .env: {erro}")
-        return EXIT_ERRO
+        print(f"Erro de configuração no .env: {error}")
+        return EXIT_ERROR
 
-    print(f"Estágios: {' -> '.join(ESTAGIOS[:ESTAGIOS.index(args.ate) + 1])}")
+    print(f"Estágios: {' -> '.join(STAGES[:STAGES.index(args.ate) + 1])}")
     print(f"Saída:    {cfg.interim_dir} e {cfg.processed_dir}")
 
     try:
-        linhas = executar(cfg, args.ate)
-    except FileNotFoundError as erro:
-        print(f"Erro: {erro}")
-        return EXIT_ERRO
+        rows = run_stages(cfg, args.ate)
+    except FileNotFoundError as error:
+        print(f"Erro: {error}")
+        return EXIT_ERROR
     except KeyboardInterrupt:
         print("\nInterrompido.")
-        return EXIT_INTERROMPIDO
+        return EXIT_INTERRUPTED
 
-    if linhas == 0:
+    if rows == 0:
         print("\nNenhuma linha sobreviveu aos filtros. Revise STATUS_FILTER no .env.")
         return EXIT_OK
 
-    print(f"\nPronto. {linhas:,} linhas no artefato final.")
+    print(f"\nPronto. {rows:,} linhas no artefato final.")
     return EXIT_OK
 
 
